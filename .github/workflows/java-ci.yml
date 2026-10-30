@@ -1,0 +1,32 @@
+name: Java CI (url-shortener)
+
+on:
+  push:
+    paths: ["url-shortener/**", ".github/workflows/java-ci.yml"]
+  pull_request:
+    paths: ["url-shortener/**", ".github/workflows/java-ci.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: url-shortener
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build and test
+        run: mvn -B verify
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: url-shortener/target/surefire-reports/

@@ -1,0 +1,200 @@
+{
+  "runs": 5,
+  "runs_finished": 5,
+  "run_success_rate": 0.8,
+  "stage_success_rate": 0.952,
+  "retry_frequency": 0.119,
+  "rollback_frequency": 0.095,
+  "fallbacks": 1,
+  "mttr_s": 4.603,
+  "e2e_latency_p50_s": 9.197,
+  "e2e_latency_p95_s": 18.579,
+  "per_run": {
+    "ambiguous-20261030T164615": {
+      "run_status": "completed",
+      "stage_executions": 10,
+      "stage_success_rate": 1.0,
+      "stage_failures": 0,
+      "retries": 0,
+      "retries_by_scope": {},
+      "retry_frequency": 0.0,
+      "rollbacks": 0,
+      "rollback_frequency": 0.0,
+      "fallbacks": 0,
+      "replans": 1,
+      "safe_stops": 0,
+      "approvals": 4,
+      "policy_findings": 1,
+      "mttr_s": null,
+      "recoveries": 0,
+      "e2e_latency_s": 9.094,
+      "human_wait_s": 0.009,
+      "active_latency_s": 9.085,
+      "llm_calls": 7,
+      "llm_calls_by_provider": {
+        "replay": 7
+      },
+      "llm_latency_p50_s": 0.0,
+      "llm_latency_p95_s": 0.0,
+      "stage_latency_p50_s": {
+        "design": 0.015,
+        "documentation": 0.008,
+        "implementation": 0.077,
+        "planning": 0.002,
+        "release": 0.043,
+        "requirements": 0.002,
+        "security_review": 0.026,
+        "verification": 8.885
+      }
+    },
+    "brownfield-20261030T164615": {
+      "run_status": "completed",
+      "stage_executions": 12,
+      "stage_success_rate": 0.917,
+      "stage_failures": 1,
+      "retries": 1,
+      "retries_by_scope": {
+        "rework": 1
+      },
+      "retry_frequency": 0.083,
+      "rollbacks": 1,
+      "rollback_frequency": 0.083,
+      "fallbacks": 0,
+      "replans": 2,
+      "safe_stops": 0,
+      "approvals": 2,
+      "policy_findings": 0,
+      "mttr_s": 9.139,
+      "recoveries": 1,
+      "e2e_latency_s": 18.579,
+      "human_wait_s": 0.005,
+      "active_latency_s": 18.574,
+      "llm_calls": 7,
+      "llm_calls_by_provider": {
+        "replay": 7
+      },
+      "llm_latency_p50_s": 0.0,
+      "llm_latency_p95_s": 0.001,
+      "stage_latency_p50_s": {
+        "design": 0.015,
+        "documentation": 0.007,
+        "implementation": 0.072,
+        "planning": 0.002,
+        "release": 0.022,
+        "requirements": 0.005,
+        "security_review": 0.03,
+        "verification": 8.996
+      }
+    },
+    "greenfield-20261030T164615": {
+      "run_status": "completed",
+      "stage_executions": 8,
+      "stage_success_rate": 1.0,
+      "stage_failures": 0,
+      "retries": 0,
+      "retries_by_scope": {},
+      "retry_frequency": 0.0,
+      "rollbacks": 0,
+      "rollback_frequency": 0.0,
+      "fallbacks": 0,
+      "replans": 0,
+      "safe_stops": 0,
+      "approvals": 1,
+      "policy_findings": 1,
+      "mttr_s": null,
+      "recoveries": 0,
+      "e2e_latency_s": 9.197,
+      "human_wait_s": 0.003,
+      "active_latency_s": 9.194,
+      "llm_calls": 5,
+      "llm_calls_by_provider": {
+        "replay": 5
+      },
+      "llm_latency_p50_s": 0.0,
+      "llm_latency_p95_s": 0.001,
+      "stage_latency_p50_s": {
+        "design": 0.015,
+        "documentation": 0.007,
+        "implementation": 0.065,
+        "planning": 0.002,
+        "release": 0.026,
+        "requirements": 0.004,
+        "security_review": 0.025,
+        "verification": 9.045
+      }
+    },
+    "policy-violation-20261030T164615": {
+      "run_status": "halted",
+      "stage_executions": 4,
+      "stage_success_rate": 0.75,
+      "stage_failures": 1,
+      "retries": 1,
+      "retries_by_scope": {
+        "stage": 1
+      },
+      "retry_frequency": 0.25,
+      "rollbacks": 3,
+      "rollback_frequency": 0.75,
+      "fallbacks": 0,
+      "replans": 0,
+      "safe_stops": 0,
+      "approvals": 0,
+      "policy_findings": 2,
+      "mttr_s": null,
+      "recoveries": 0,
+      "e2e_latency_s": 0.273,
+      "human_wait_s": 0.0,
+      "active_latency_s": 0.273,
+      "llm_calls": 5,
+      "llm_calls_by_provider": {
+        "replay": 5
+      },
+      "llm_latency_p50_s": 0.0,
+      "llm_latency_p95_s": 0.0,
+      "stage_latency_p50_s": {
+        "design": 0.014,
+        "planning": 0.002,
+        "requirements": 0.003
+      }
+    },
+    "resilience-drill-20261030T164615": {
+      "run_status": "completed",
+      "stage_executions": 8,
+      "stage_success_rate": 1.0,
+      "stage_failures": 0,
+      "retries": 3,
+      "retries_by_scope": {
+        "llm": 3
+      },
+      "retry_frequency": 0.375,
+      "rollbacks": 0,
+      "rollback_frequency": 0.0,
+      "fallbacks": 1,
+      "replans": 0,
+      "safe_stops": 1,
+      "approvals": 2,
+      "policy_findings": 1,
+      "mttr_s": 0.066,
+      "recoveries": 1,
+      "e2e_latency_s": 11.239,
+      "human_wait_s": 9.364,
+      "active_latency_s": 1.875,
+      "llm_calls": 8,
+      "llm_calls_by_provider": {
+        "replay": 4
+      },
+      "llm_latency_p50_s": 0.0,
+      "llm_latency_p95_s": 0.001,
+      "stage_latency_p50_s": {
+        "design": 0.487,
+        "documentation": 0.008,
+        "implementation": 0.072,
+        "planning": 1.159,
+        "release": 0.02,
+        "requirements": 0.003,
+        "security_review": 0.022,
+        "verification": 9.356
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+[
+  {
+    "requirement": "FR-1",
+    "text": "A configurable denylist shortener.blocked-domains (empty by default) defines blocked domains.",
+    "tasks": [
+      "T1",
+      "T2",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/config/ShortenerProperties.java",
+      "src/main/resources/application.yml",
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-2",
+    "text": "Creating a link whose host equals a blocked domain or is a subdomain of it is rejected with HTTP 400.",
+    "tasks": [
+      "T3",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/service/UrlValidator.java",
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-3",
+    "text": "Domains that merely contain a blocked name are unaffected; existing links are not modified.",
+    "tasks": [
+      "T3",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/service/UrlValidator.java",
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/service/UrlValidatorTest.java",
+      "src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java"
+    ],
+    "verified": true
+  }
+]

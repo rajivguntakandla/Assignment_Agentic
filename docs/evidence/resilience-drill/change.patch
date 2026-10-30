@@ -1,0 +1,246 @@
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,5 @@
++# Changelog
++
++## 2026-10-30 - Bulk link creation API
++
++Bulk link creation API: Add POST /api/v1/links/bulk with per-item results, reusing LinkService for every item.
+--- /dev/null
++++ b/docs/features/bulk-link-creation-api.md
+@@ -0,0 +1,39 @@
++# Bulk link creation API
++
++Let partners create many short links in one call with independent per-item outcomes.
++
++## Requirements
++
++- **FR-1** POST /api/v1/links/bulk accepts between 1 and 100 link requests (url, optional customAlias, optional expiresAt).
++  - Acceptance: A request with 2 valid items returns HTTP 200 with created=2 and two results in request order.
++  - Acceptance: Each created item exposes the same fields as the single-create API (code, shortUrl, targetUrl, ...).
++- **FR-2** Items are processed independently; an invalid or conflicting item does not prevent other items from being created.
++  - Acceptance: An unsafe URL is reported as status=error with error.status=400 while valid siblings are created.
++  - Acceptance: A duplicate custom alias within the batch is reported with error.status=409.
++- **FR-3** Batches with zero items, more than 100 items, or no items field are rejected as a whole with HTTP 400.
++  - Acceptance: items: [] returns 400 with an RFC 9457 problem detail
++  - Acceptance: 101 items returns 400 and creates nothing
++
++## Design
++
++New BulkLinkController at POST /api/v1/links/bulk that loops over the items and delegates each one to the existing LinkService.create, translating domain exceptions into per-item error results.
++
++- D1: Reuse LinkService.create per item instead of a repository-level batch insert - Validation, alias reservation and SSRF rules stay in one place; no duplicated business logic.
++- D2: Each item runs in its own transaction (partial success) - Matches the requirement that items are independent; one bad URL must not roll back the others.
++- D3: Return HTTP 200 with per-item status instead of 207 Multi-Status - 207 is WebDAV-specific and poorly supported by client libraries; per-item status is explicit.
++- D4: Enforce 1..100 items with Bean Validation on the request DTO; do not cascade @Valid to items - Batch-level shape errors fail fast with 400; item-level errors must be reported per item.
++
++## API changes
++
++- POST /api/v1/links/bulk (new, additive)
++
++## Files changed
++
++- `src/main/java/io/agentic/shortener/web/BulkLinkController.java`
++- `src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksRequest.java`
++- `src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksResponse.java`
++- `src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java`
++
++## Limitations
++
++Generated from templates (LLM unavailable); review wording.
+--- /dev/null
++++ b/src/main/java/io/agentic/shortener/web/BulkLinkController.java
+@@ -0,0 +1,66 @@
++package io.agentic.shortener.web;
++
++import io.agentic.shortener.config.ShortenerProperties;
++import io.agentic.shortener.service.ConflictException;
++import io.agentic.shortener.service.CreateLinkCommand;
++import io.agentic.shortener.service.CreateLinkResult;
++import io.agentic.shortener.service.InvalidUrlException;
++import io.agentic.shortener.service.LinkService;
++import io.agentic.shortener.web.dto.BulkCreateLinksRequest;
++import io.agentic.shortener.web.dto.BulkCreateLinksResponse;
++import io.agentic.shortener.web.dto.BulkCreateLinksResponse.ItemResult;
++import io.agentic.shortener.web.dto.CreateLinkRequest;
++import io.agentic.shortener.web.dto.LinkResponse;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import java.util.ArrayList;
++import java.util.List;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * Bulk creation. Each item goes through {@link LinkService#create} in its own transaction, so validation rules
++ * are shared with the single-create endpoint and one failing item never affects the others.
++ */
++@RestController
++@RequestMapping("/api/v1/links/bulk")
++@Tag(name = "Links")
++public class BulkLinkController {
++
++    private final LinkService linkService;
++    private final ShortenerProperties properties;
++
++    public BulkLinkController(LinkService linkService, ShortenerProperties properties) {
++        this.linkService = linkService;
++        this.properties = properties;
++    }
++
++    @PostMapping
++    @Operation(summary = "Shorten up to 100 URLs",
++            description = "Returns 200 with one result per item, in request order (partial success).")
++    public BulkCreateLinksResponse create(@Valid @RequestBody BulkCreateLinksRequest request) {
++        List<ItemResult> results = new ArrayList<>(request.items().size());
++        int created = 0;
++        for (int i = 0; i < request.items().size(); i++) {
++            CreateLinkRequest item = request.items().get(i);
++            if (item == null) {
++                results.add(ItemResult.failed(i, 400, "item must not be null"));
++                continue;
++            }
++            try {
++                CreateLinkResult result = linkService.create(
++                        new CreateLinkCommand(item.url(), item.customAlias(), item.expiresAt(), null));
++                results.add(ItemResult.created(i, LinkResponse.from(result.link(), properties.baseUrl())));
++                created++;
++            } catch (InvalidUrlException e) {
++                results.add(ItemResult.failed(i, 400, e.getMessage()));
++            } catch (ConflictException e) {
++                results.add(ItemResult.failed(i, 409, e.getMessage()));
++            }
++        }
++        return new BulkCreateLinksResponse(created, results.size() - created, results);
++    }
++}
+--- /dev/null
++++ b/src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksRequest.java
+@@ -0,0 +1,13 @@
++package io.agentic.shortener.web.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import java.util.List;
++
++/** Items are deliberately not cascaded with {@code @Valid}: item errors are reported per item. */
++@Schema(description = "Between 1 and 100 links to create; each item is processed independently")
++public record BulkCreateLinksRequest(
++        @NotNull @Size(min = 1, max = 100, message = "must contain between 1 and 100 items")
++        List<CreateLinkRequest> items) {
++}
+--- /dev/null
++++ b/src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksResponse.java
+@@ -0,0 +1,20 @@
++package io.agentic.shortener.web.dto;
++
++import java.util.List;
++
++public record BulkCreateLinksResponse(int created, int failed, List<ItemResult> results) {
++
++    public record ItemResult(int index, String status, LinkResponse link, ItemError error) {
++
++        public static ItemResult created(int index, LinkResponse link) {
++            return new ItemResult(index, "created", link, null);
++        }
++
++        public static ItemResult failed(int index, int httpStatus, String detail) {
++            return new ItemResult(index, "error", null, new ItemError(httpStatus, detail));
++        }
++    }
++
++    public record ItemError(int status, String detail) {
++    }
++}
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java
+@@ -0,0 +1,85 @@
++package io.agentic.shortener.web;
++
++import static org.hamcrest.Matchers.hasSize;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.util.stream.Collectors;
++import java.util.stream.IntStream;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.ResultActions;
++
++@SpringBootTest
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++class BulkLinkApiIntegrationTest {
++
++    @Autowired
++    MockMvc mvc;
++
++    @Autowired
++    ObjectMapper json;
++
++    @Test
++    void createsAllValidItemsInRequestOrder() throws Exception {
++        bulk("{\"items\":[{\"url\":\"https://example.com/a\"},{\"url\":\"https://example.com/b\"}]}")
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.created").value(2))
++                .andExpect(jsonPath("$.failed").value(0))
++                .andExpect(jsonPath("$.results", hasSize(2)))
++                .andExpect(jsonPath("$.results[0].index").value(0))
++                .andExpect(jsonPath("$.results[0].status").value("created"))
++                .andExpect(jsonPath("$.results[0].link.targetUrl").value("https://example.com/a"))
++                .andExpect(jsonPath("$.results[1].link.targetUrl").value("https://example.com/b"));
++    }
++
++    @Test
++    void reportsItemErrorsWithoutFailingOtherItems() throws Exception {
++        bulk("{\"items\":[{\"url\":\"https://example.com/ok\"},{\"url\":\"javascript:alert(1)\"},"
++                + "{\"url\":\"https://example.com/x\",\"customAlias\":\"bulk-dup\"},"
++                + "{\"url\":\"https://example.com/y\",\"customAlias\":\"bulk-dup\"}]}")
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.created").value(2))
++                .andExpect(jsonPath("$.failed").value(2))
++                .andExpect(jsonPath("$.results[1].status").value("error"))
++                .andExpect(jsonPath("$.results[1].error.status").value(400))
++                .andExpect(jsonPath("$.results[2].link.code").value("bulk-dup"))
++                .andExpect(jsonPath("$.results[3].error.status").value(409));
++    }
++
++    @Test
++    void rejectsEmptyOversizedAndMissingBatches() throws Exception {
++        bulk("{\"items\":[]}").andExpect(status().isBadRequest());
++        bulk("{}").andExpect(status().isBadRequest());
++        String items = IntStream.range(0, 101)
++                .mapToObj(i -> "{\"url\":\"https://example.com/" + i + "\"}")
++                .collect(Collectors.joining(","));
++        bulk("{\"items\":[" + items + "]}")
++                .andExpect(status().isBadRequest())
++                .andExpect(jsonPath("$.detail").value("items: must contain between 1 and 100 items"));
++    }
++
++    @Test
++    void bulkCreatedLinksRedirect() throws Exception {
++        String body = bulk("{\"items\":[{\"url\":\"https://example.com/target\"}]}")
++                .andReturn().getResponse().getContentAsString();
++        String code = json.readTree(body).at("/results/0/link/code").asText();
++        mvc.perform(get("/" + code))
++                .andExpect(status().isFound())
++                .andExpect(header().string("Location", "https://example.com/target"));
++    }
++
++    private ResultActions bulk(String content) throws Exception {
++        return mvc.perform(post("/api/v1/links/bulk").contentType(MediaType.APPLICATION_JSON).content(content));
++    }
++}

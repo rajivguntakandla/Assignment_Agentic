@@ -1,0 +1,137 @@
+{
+  "summary": "Add GET /api/v1/links to the existing LinkController. It returns a bare JSON array of LinkResponse items, newest first, bounded by limit (default 20, range 1..100).\n\nThe list applies no visibility predicate. GET /api/v1/links/{code} goes through LinkService.get(), which throws only LinkNotFoundException and also returns expired and deactivated links. So every persisted link is retrievable by code, and the list returns all links ordered by createdAt DESC, id DESC.\n\nThe repository bounds the query at the database level with a derived Spring Data query that takes a Limit.\n\nlimit is bound as a request parameter. Range violations throw InvalidUrlException, following the AnalyticsService 'days' convention; it is already mapped to a 400 ProblemDetail. Non-integer values are already rejected with 400 through MethodArgumentTypeMismatchException. An empty 'limit=' is detected explicitly and rejected the same way.\n\nNo changes are made to GlobalExceptionHandler, LinkResponse, the schema, or security; there is no security configuration in the codebase. Tests are a single MockMvc integration class under @ActiveProfiles(\"test\"). It uses TestClockConfig/MutableClock to control createdAt.",
+  "decisions": [
+    {
+      "id": "D1",
+      "decision": "Return all links. Apply no visibility predicate in the list query.",
+      "rationale": "FR-5 requires the list to contain exactly the links for which GET /api/v1/links/{code} succeeds. That endpoint uses LinkService.get(), which fails only with LinkNotFoundException (404) and returns expired and deactivated links too. Every persisted link is therefore retrievable, and parity means no filter. This also satisfies 'limit applies after visibility filtering' trivially, because the visibility filter is the identity.",
+      "alternatives": [
+        "Filter out expired/deactivated links (as the previous design suggested). Rejected: those links return 200 from GET /{code}, so excluding them breaks FR-5 parity.",
+        "Reuse a redirect-style 'active' check (as RedirectController may use, possibly via LinkGoneException). Rejected: that governs redirects, not the JSON lookup the spec references."
+      ]
+    },
+    {
+      "id": "D2",
+      "decision": "Add a derived query to LinkRepository: List<Link> findAllByOrderByCreatedAtDescIdDesc(org.springframework.data.domain.Limit limit). Confirm the actual property names on Link (createdAt, id) and adjust the method name to match.",
+      "rationale": "Spring Data 3.2+ (included with Boot 3.5) supports a Limit parameter on derived queries. This emits ORDER BY created_at DESC, id DESC LIMIT n, so at most limit rows are fetched (NFR) without the extra count query that Page-returning methods run. Ordering by id DESC gives the deterministic tie-break from the spec assumptions. No new dependency is added.",
+      "alternatives": [
+        "findAll(PageRequest.of(0, limit, Sort.by(desc(createdAt), desc(id)))). Rejected: it returns a Page and triggers an unnecessary COUNT query.",
+        "A @Query JPQL query with setMaxResults through a custom fragment. Rejected: more code for the same SQL.",
+        "findAll() then sort and limit in memory. Rejected: violates the bounded-fetch NFR."
+      ]
+    },
+    {
+      "id": "D3",
+      "decision": "Add LinkService.listRecent(int limit) (name may be adjusted to local conventions). It validates 1 <= limit <= 100 and throws InvalidUrlException the same way AnalyticsService does for 'days', before any repository access. It then returns linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(limit)). Define the default (20) and max (100) as constants in LinkService. Mirror any @Transactional(readOnly = true) annotation that get() carries.",
+      "rationale": "This follows the reviewer-mandated convention: InvalidUrlException is already mapped by GlobalExceptionHandler to an HTTP 400 application/problem+json body with status and title. A ResponseStatusException would instead fall into the catch-all Exception handler and become a 500. Validating before the query guarantees that rejected requests have no side effects and return no data. Keeping the logic in LinkService matches how the controller already delegates to the service for get().",
+      "alternatives": [
+        "Throw ResponseStatusException(BAD_REQUEST). Rejected: the catch-all @ExceptionHandler(Exception.class) turns it into a 500.",
+        "Use @Min/@Max with @Validated (HandlerMethodValidationException). Rejected: it is not shown to be handled by GlobalExceptionHandler and would likely hit the catch-all 500, and modifying the handler is disallowed.",
+        "Add a new exception type plus a handler mapping. Rejected: it requires changing GlobalExceptionHandler, which the reviewer forbade.",
+        "Make limit defaults and max configurable via ShortenerProperties. Rejected: not required, and not the smallest change."
+      ]
+    },
+    {
+      "id": "D4",
+      "decision": "In LinkController, add @GetMapping on the existing /api/v1/links base path (same path as the existing POST). The handler signature is list(@RequestParam(name = \"limit\", required = false) Integer limit, HttpServletRequest request).\n- Absent parameter (request.getParameter(\"limit\") == null): use 20.\n- Present but empty (limit == null while the raw parameter is non-null, i.e. 'limit='): throw InvalidUrlException.\n- Otherwise: call linkService.listRecent(limit).\nMap each Link with LinkResponse.from, invoked exactly as the GET /{code} handler invokes it, and return List<LinkResponse>.",
+      "rationale": "Bare-array output satisfies FR-1. Reusing LinkResponse.from guarantees FR-4 shape parity and keeps the two endpoints in sync for future changes.\n\nSpring applies a @RequestParam defaultValue to empty strings as well, and the Integer converter maps \"\" to null. Without defaultValue and with an explicit raw-parameter check, absent can be told apart from empty, as the spec's 'limit=' assumption requires.\n\nNon-integer values (abc, 1.5) still fail binding with MethodArgumentTypeMismatchException, which the existing handler already renders as 400. An int-typed binding keeps that behaviour, as the reviewer requested.",
+      "alternatives": [
+        "@RequestParam(defaultValue = \"20\") int limit. Rejected: 'limit=' silently becomes 20, contradicting the spec assumption.",
+        "Bind as String and parse manually. Rejected: it duplicates the existing type-mismatch handling and diverges from the reviewer-requested int-parameter convention.",
+        "A new dedicated controller class. Rejected: the existing LinkController owns /api/v1/links."
+      ]
+    },
+    {
+      "id": "D5",
+      "decision": "Make no security changes and add no migration.",
+      "rationale": "The codebase has no security configuration (no SecurityConfig in any layer). GET /api/v1/links/{code} is unauthenticated, so the new endpoint is unauthenticated too, which satisfies FR-5 parity. The spec assumes links.created_at is already persisted, so no schema change is required. RateLimitFilter is left untouched, because endpoint-specific rate limiting is out of scope.",
+      "alternatives": [
+        "Add a Flyway V2 migration indexing links(created_at DESC, id DESC). Rejected for now: the spec does not require it. Revisit if table size makes the ORDER BY + LIMIT scan costly."
+      ]
+    },
+    {
+      "id": "D6",
+      "decision": "Write a single integration test class, LinkListApiIntegrationTest, modelled on LinkApiIntegrationTest. It uses MockMvc, @ActiveProfiles(\"test\") and the same Spring test setup, and imports TestClockConfig. It uses MutableClock to advance time between link creations so createdAt values are distinct and ordered. Links are seeded through the same path LinkApiIntegrationTest uses; prefer LinkService creation for bulk seeds (25 and 150 links) if POST traffic would trip RateLimitFilter in the test profile.",
+      "rationale": "This follows the reviewer's direction and the existing test conventions. createdAt comes from the injected Clock, so MutableClock gives deterministic t1 < t2 < t3 ordering.\n\nThe class covers:\n- Default and explicit limits: 25 links with no limit returns 20; limit=5 returns 5; 3 links with limit=10 returns 3; limit=1; 150 links with limit=100 returns 100.\n- Ordering and the empty [] result.\n- Rejections for limit=0, 101, -1, abc, 1.5 and limit=: each is 400 application/problem+json with status=400 and a title, contains no link data, and leaves the link count unchanged.\n- Item JSON-equality with GET /api/v1/links/{code}.\n- Visibility parity: a deactivated link (via DELETE /api/v1/links/{code}) and an expired link both still return 200 from GET /{code} and both appear in the list.\n- Two calls returning identical arrays.\n- Unauthenticated access returning 200 for both endpoints.\n\nExisting tests are not modified.",
+      "alternatives": [
+        "A separate repository slice test (@DataJpaTest). Rejected per reviewer: single integration class only.",
+        "Seed rows directly via LinkRepository.save with hand-set timestamps. Rejected: it bypasses the Clock-driven createdAt and may depend on unshown Link constructors."
+      ]
+    }
+  ],
+  "api_changes": [
+    "New endpoint: GET /api/v1/links. Optional query parameter limit (integer, default 20, valid range 1..100). Returns 200 application/json with a bare JSON array of LinkResponse objects, ordered by createdAt DESC, id DESC. Returns [] when no links exist.",
+    "GET /api/v1/links with limit outside 1..100 or with an empty limit (limit=) returns 400 application/problem+json through the existing InvalidUrlException mapping.",
+    "GET /api/v1/links with a non-integer limit (abc, 1.5) returns 400 application/problem+json through the existing MethodArgumentTypeMismatchException handling.",
+    "No changes to POST /api/v1/links, GET /api/v1/links/{code}, DELETE /api/v1/links/{code}, GET /api/v1/links/{code}/stats, or GET /{code}."
+  ],
+  "schema_changes": [],
+  "planned_files": [
+    "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+    "src/main/java/io/agentic/shortener/service/LinkService.java",
+    "src/main/java/io/agentic/shortener/web/LinkController.java",
+    "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+  ],
+  "risks": [
+    "Link entity property names (createdAt, id) are not confirmed. The derived query method name must match the actual field names, or Spring Data fails at startup. Alternatively, use an equivalent @Query with a Limit parameter.",
+    "LinkRepository is assumed to be a Spring Data JPA repository. If it is JDBC-based, implement the same ORDER BY created_at DESC, id DESC LIMIT ? query in its existing style.",
+    "InvalidUrlException's constructor signature and the problem-detail title it produces are not shown. Construct it exactly as AnalyticsService does for 'days'. The title/detail text may mention a URL-oriented message; this is acceptable for the acceptance criteria but may read oddly to clients.",
+    "The LinkResponse.from signature is not shown; it may need extra arguments such as a base URL from ShortenerProperties. The list handler must call it identically to the GET /{code} handler, or FR-4 parity breaks.",
+    "Asserting non-increasing createdAt in the list response requires LinkResponse to expose createdAt. If it does not, assert ordering by the codes created at known MutableClock instants instead.",
+    "RateLimitFilter may apply to /api/v1/** in the test profile. Seeding 25 or 150 links via POST could hit 429s, and repeated GET calls could too; seed through LinkService and check the test profile's rate-limit settings.",
+    "The test package is chosen as io.agentic.shortener.web. If LinkApiIntegrationTest, TestClockConfig or MutableClock live in a different package with package-private visibility, place the new test alongside them.",
+    "If a link status exists that makes LinkService.get() throw LinkNotFoundException for persisted rows (e.g. soft-deleted rows filtered in get()), the no-predicate list would diverge. Verify get() has no such filter before implementing; the reviewer states it has none.",
+    "Without an index on links(created_at, id), the bounded query may sort the full table as data grows. A future Flyway V2 index migration can address this without API impact."
+  ],
+  "impact": {
+    "seed_files": [
+      "src/main/java/io/agentic/shortener/domain/Link.java",
+      "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+      "src/main/java/io/agentic/shortener/service/CreateLinkResult.java",
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/main/java/io/agentic/shortener/web/dto/LinkResponse.java"
+    ],
+    "impacted_files": [
+      "src/main/java/io/agentic/shortener/domain/ClickEvent.java",
+      "src/main/java/io/agentic/shortener/domain/Link.java",
+      "src/main/java/io/agentic/shortener/repository/ClickEventRepository.java",
+      "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+      "src/main/java/io/agentic/shortener/service/AnalyticsService.java",
+      "src/main/java/io/agentic/shortener/service/CreateLinkResult.java",
+      "src/main/java/io/agentic/shortener/service/LinkGoneException.java",
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/GlobalExceptionHandler.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/main/java/io/agentic/shortener/web/RedirectController.java",
+      "src/main/java/io/agentic/shortener/web/dto/LinkResponse.java"
+    ],
+    "impacted_modules": [
+      "domain",
+      "repository",
+      "service",
+      "web"
+    ],
+    "affected_endpoints": [
+      "DELETE /api/v1/links/{code}",
+      "GET /api/v1/links/{code}",
+      "GET /api/v1/links/{code}/stats",
+      "GET /{code:[A-Za-z0-9_-]{3,32}}",
+      "POST /api/v1/links"
+    ],
+    "data_flows": [
+      "LinkController -> AnalyticsService -> LinkService -> ClickEventRepository -> LinkRepository -> tables(click_events, links)",
+      "RedirectController -> LinkService -> ClickEventRepository -> LinkRepository -> tables(click_events, links)"
+    ],
+    "tables": [
+      "click_events",
+      "links"
+    ],
+    "risk_flags": [
+      "existing public API modified"
+    ]
+  },
+  "risk_level": "high",
+  "requires_approval": true,
+  "revision": 2
+}

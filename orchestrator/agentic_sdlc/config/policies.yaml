@@ -1,0 +1,90 @@
+# Policy-as-configuration. Evaluated against the *added lines* of every change set before it can be verified,
+# and again (with full context) by the security review stage. Severity semantics:
+#   block            -> the change set is rejected; the implementation agent must rework it
+#   require_approval -> allowed, but a human must explicitly acknowledge it at the release checkpoint
+#   warn             -> recorded in the audit log and the release report
+
+change_control:
+  allowed_paths:
+    - src/main/java/
+    - src/test/java/
+    - src/main/resources/db/migration/
+    - src/main/resources/application.yml
+    - src/test/resources/
+    - docs/
+  protected_paths:          # never writable by agents
+    - .github/
+    - mvnw
+    - .mvn/
+  approval_paths:           # writable, but always needs explicit human acknowledgement
+    - pom.xml
+    - src/main/resources/application.yml
+  immutable_existing:       # existing files under these prefixes must never be modified (applied migrations)
+    - src/main/resources/db/migration/
+  security_sensitive:       # touching these makes the design high-impact
+    - src/main/java/io/agentic/shortener/service/UrlValidator.java
+    - src/main/java/io/agentic/shortener/ratelimit/
+    - src/main/java/io/agentic/shortener/config/
+    - src/main/java/io/agentic/shortener/web/GlobalExceptionHandler.java
+  schema_paths:
+    - src/main/java/io/agentic/shortener/domain/
+    - src/main/resources/db/migration/
+  max_files_changed: 20
+  max_lines_changed: 1500
+  require_tests_with_code: true
+
+security:
+  rules:
+    - id: SEC-001-command-exec
+      pattern: 'Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder\('
+      severity: block
+      message: Process execution is not allowed in service code
+    - id: SEC-002-deserialization
+      pattern: 'ObjectInputStream|XMLDecoder'
+      severity: block
+      message: Native Java deserialization of untrusted data is forbidden
+    - id: SEC-003-sql-concat
+      pattern: '(createNativeQuery|createQuery|executeQuery|nativeQuery\s*=\s*true[^)]*value\s*=)\s*\(?\s*"[^"]*"\s*\+'
+      severity: block
+      message: SQL built by string concatenation (injection risk); use bound parameters
+    - id: SEC-004-tls-bypass
+      pattern: 'X509TrustManager|setHostnameVerifier|TrustAllCerts'
+      severity: block
+      message: TLS verification must not be bypassed
+    - id: SEC-005-cors-wildcard
+      pattern: '@CrossOrigin\s*\(\s*(origins\s*=\s*)?"\*"'
+      severity: require_approval
+      message: Wildcard CORS widens the attack surface
+    - id: SEC-006-weak-random
+      pattern: 'new\s+(java\.util\.)?Random\s*\('
+      severity: warn
+      message: java.util.Random is predictable; use SecureRandom for identifiers
+      main_only: true
+    - id: SEC-007-open-redirect
+      pattern: 'sendRedirect\(\s*request\.getParameter'
+      severity: block
+      message: Redirect target taken directly from request input (open redirect)
+  secrets:
+    - id: SEC-100-private-key
+      pattern: '-----BEGIN (RSA |EC )?PRIVATE KEY-----'
+    - id: SEC-101-aws-key
+      pattern: 'AKIA[0-9A-Z]{16}'
+    - id: SEC-102-anthropic-key
+      pattern: 'sk-ant-[A-Za-z0-9_\-]{10,}'
+    - id: SEC-103-hardcoded-credential
+      pattern: '(?i)(password|secret|api[_-]?key)\s*[:=]\s*"[^"$]{8,}"'
+
+compliance:
+  rules:
+    - id: CMP-001-pii-field
+      pattern: '(?i)private\s+String\s+(ip|ipAddress|clientIp|email|phone|ssn)\s*;'
+      severity: require_approval
+      message: New persistent field looks like personal data; needs privacy review (data minimisation)
+    - id: CMP-002-pii-logging
+      pattern: '(?i)log\.(trace|debug|info|warn|error)\(.*(getRemoteAddr|email|password)'
+      severity: block
+      message: Personal data or credentials must not be written to logs
+    - id: CMP-003-stacktrace-exposure
+      pattern: 'include-stacktrace:\s*always|printStackTrace\(\)'
+      severity: block
+      message: Stack traces must not be exposed to clients or stdout

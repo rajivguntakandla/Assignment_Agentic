@@ -1,0 +1,760 @@
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,5 @@
++# Changelog
++
++## 2026-10-30 - Add an endpoint GET /api/v1/links that lists the most recent
++
++Added `GET /api/v1/links`, which returns the most recently created short links as a bare JSON array ordered newest first by creation time (ties broken by id, descending). The optional `limit` query parameter defaults to 20 and accepts 1 to 100. Out-of-range, empty or non-integer values return HTTP 400 with an `application/problem+json` body through the existing error handling. Each item has exactly the same JSON shape as `GET /api/v1/links/{code}`. The list is unauthenticated, like that endpoint, applies no per-caller filtering, and includes deactivated and expired links, because those are still retrievable by code. Results are fetched with a database-bounded query. There is no pagination or total count, and existing endpoints, error handling, schema and tests are unchanged.
+--- /dev/null
++++ b/docs/features/list-recent-links.md
+@@ -0,0 +1,198 @@
++# List most recently created links: `GET /api/v1/links`
++
++## Overview
++
++`GET /api/v1/links` returns the most recently created short links, newest first, as a bare JSON array. An optional `limit` query parameter bounds the result size. It defaults to 20 and accepts values from 1 to 100. Each array item has exactly the same JSON shape as the body of `GET /api/v1/links/{code}`.
++
++## Requirements traceability
++
++| ID | Summary | Where it is covered in this document |
++|----|---------|--------------------------------------|
++| FR-1 | `GET /api/v1/links` returns 200 with a bare JSON array, newest first, and `[]` when empty. Existing endpoints are unchanged. | [Successful response](#successful-response-fr-1-fr-2-fr-4), [Ordering](#ordering-fr-1) |
++| FR-2 | Optional `limit`: default 20, range 1..100. The response holds at most `limit` items, which are the newest. | [Query parameters](#query-parameters-fr-2-fr-3), [Limit semantics](#limit-semantics-fr-2) |
++| FR-3 | An out-of-range `limit` returns 400 with an RFC 9457 problem detail through the existing error handling. | [Error responses](#error-responses-fr-3) |
++| FR-4 | Each item is JSON-equal to the `GET /api/v1/links/{code}` body and uses the same representation. | [Item shape](#item-shape-fr-4) |
++| FR-5 | The list contains exactly the links retrievable via `GET /api/v1/links/{code}`, under the same access control and with no ownership filtering. | [Visibility and access](#visibility-and-access-fr-5) |
++
++## Endpoint
++
++```
++GET /api/v1/links
++```
++
++- **Authentication:** none. The endpoint is exactly as open as `GET /api/v1/links/{code}`, which is unauthenticated in this service (FR-5).
++- **Success content type:** `application/json`
++- **Error content type:** `application/problem+json`
++
++### Query parameters (FR-2, FR-3)
++
++| Name | Type | Required | Default | Valid values |
++|------|------|----------|---------|--------------|
++| `limit` | integer | no | `20` | `1` to `100` inclusive |
++
++The default of 20 applies only when the parameter is **absent**. An empty value (`?limit=`) is rejected; it does not fall back to the default.
++
++## Successful response (FR-1, FR-2, FR-4)
++
++The response is HTTP `200 OK` with a top-level JSON array. There is no envelope, no wrapper object and no metadata.
++
++Request:
++
++```http
++GET /api/v1/links?limit=2 HTTP/1.1
++Accept: application/json
++```
++
++Response:
++
++```http
++HTTP/1.1 200 OK
++Content-Type: application/json
++
++[
++  { /* body of GET /api/v1/links/{code} for the newest link */ },
++  { /* body of GET /api/v1/links/{code} for the second-newest link */ }
++]
++```
++
++> The individual item fields are deliberately not repeated here. Each item is the exact `GET /api/v1/links/{code}` response body (see [Item shape](#item-shape-fr-4)). Refer to that endpoint's documentation for the field list.
++
++When no links exist:
++
++```http
++HTTP/1.1 200 OK
++Content-Type: application/json
++
++[]
++```
++
++### Ordering (FR-1)
++
++- Items are ordered by creation time, newest first.
++- For any two adjacent items, the first item's creation time is greater than or equal to the second's.
++- "Most recently created" means creation time. Last access and update times are not used.
++- Links with identical creation timestamps are ordered by a stable secondary key (the link's primary key, descending), so results are deterministic. Clients should not depend on this tie-break.
++
++### Limit semantics (FR-2)
++
++| Visible links | Request | Result |
++|---------------|---------|--------|
++| 25 | `GET /api/v1/links` | The 20 newest |
++| 25 | `GET /api/v1/links?limit=5` | The 5 newest, newest first |
++| 3 | `GET /api/v1/links?limit=10` | All 3 |
++| any | `GET /api/v1/links?limit=1` | At most 1 |
++| 150 | `GET /api/v1/links?limit=100` | The 100 newest |
++
++### Item shape (FR-4)
++
++Each array element is built with the same response representation used by `GET /api/v1/links/{code}` (`LinkResponse`, created via `LinkResponse.from(link, properties.baseUrl())`). For any link `L` in the list, the item for `L` is JSON-equal to the body of a successful `GET /api/v1/links/{L.code}` in the same data state. Any future change to that representation shows up in both endpoints.
++
++### Visibility and access (FR-5)
++
++The list contains exactly the links for which `GET /api/v1/links/{code}` succeeds.
++
++- `GET /api/v1/links/{code}` returns every persisted link, **including deactivated and expired links**. It fails only when the link does not exist (404).
++- The list therefore applies **no** visibility filter: deactivated and expired links appear in it.
++- Because no link is excluded, `limit` applies to the full set of links. This still satisfies the rule that the limit applies after visibility filtering.
++- There is no per-caller or owner-based filtering. All callers receive the same list for the same data state.
++- There is no authentication on either endpoint. Any caller that can reach `GET /api/v1/links/{code}` can reach `GET /api/v1/links`.
++
++An item's presence in the list says nothing about whether its short URL currently redirects. Check the item's own fields, or the redirect endpoint, for that.
++
++## Error responses (FR-3)
++
++Invalid `limit` values are rejected with HTTP `400 Bad Request` and an RFC 9457 problem detail. The response is produced by the service's existing `ProblemDetail` error handling, and no new error format is introduced. A rejected request returns no link data and has no side effects: validation happens before any data access.
++
++| Input | Result | Mechanism |
++|-------|--------|-----------|
++| `?limit=0` | 400 | Range check (existing `InvalidUrlException` mapping) |
++| `?limit=101` | 400 | Range check (existing `InvalidUrlException` mapping) |
++| `?limit=-1` | 400 | Range check (existing `InvalidUrlException` mapping) |
++| `?limit=` (empty) | 400 | Explicit empty-value check (existing `InvalidUrlException` mapping) |
++| `?limit=abc` | 400 | Type conversion failure (existing `MethodArgumentTypeMismatchException` handling) |
++| `?limit=1.5` | 400 | Type conversion failure (existing `MethodArgumentTypeMismatchException` handling) |
++
++Request:
++
++```http
++GET /api/v1/links?limit=0 HTTP/1.1
++```
++
++Response:
++
++```http
++HTTP/1.1 400 Bad Request
++Content-Type: application/problem+json
++
++{
++  "status": 400,
++  "title": "<title set by the existing error handler>"
++}
++```
++
++The body always contains at least `status` and `title`. The exact `title`, `detail` and any other members are those produced by the existing handler for the exception involved, so they are not fixed here. Clients should rely on the HTTP status and `status` member, not on message text.
++
++## Unchanged endpoints
++
++The following endpoints are not changed: `POST /api/v1/links`, `GET /api/v1/links/{code}`, `DELETE /api/v1/links/{code}`, `GET /api/v1/links/{code}/stats` and `GET /{code}`. Existing tests are unmodified.
++
++## Limitations
++
++- **No pagination.** There is no offset, cursor, next-page link or total count. At most the 100 newest links can be retrieved, and older links are not reachable through this endpoint.
++- **No consistent snapshot.** Two calls may return different results if links are created between them. Clients cannot page through results with repeated calls.
++- **No filtering, search or alternative sort orders.** The order is always newest first by creation time.
++- **Deactivated and expired links are included** (see FR-5). Clients that want only active links must filter on the client side using the item fields.
++- **Unauthenticated and unscoped.** Any caller can list the newest links across all users, mirroring `GET /api/v1/links/{code}`. Operators should take this into account, because it makes recent links enumerable.
++- **No endpoint-specific caching or rate limiting.** The existing `RateLimitFilter` was not modified for this endpoint.
++- **No supporting index.** No migration was added. `ORDER BY created_at DESC, id DESC LIMIT n` may become slower on large `links` tables. A `links(created_at DESC, id DESC)` index is a candidate follow-up.
++- **Fixed bounds.** The default (20) and maximum (100) are not configurable.
++
++## Maintainer notes
++
++### Implementation
++
++- **`LinkRepository`:** adds the derived query `findAllByOrderByCreatedAtDescIdDesc(org.springframework.data.domain.Limit)`.
++  - The database applies ordering and `LIMIT`, so at most `limit` rows are fetched.
++  - No `COUNT` query runs.
++  - There is no visibility predicate.
++- **`LinkService.listRecent(int)`:** validates `1 <= limit <= 100` before any repository access and throws the existing `InvalidUrlException` on violation. This follows the convention used for `days` in `AnalyticsService`.
++- **`LinkController`:** adds a `@GetMapping` on the existing `/api/v1/links` base path.
++  - `limit` is bound as an optional `Integer` with no `defaultValue`.
++  - If the raw parameter is absent, 20 is used.
++  - If it is present but empty, `InvalidUrlException` is thrown.
++  - Non-integer values fail binding and go through the existing type-mismatch handling.
++  - Items are mapped with `LinkResponse.from(link, properties.baseUrl())`, the same call as the `GET /{code}` handler.
++- **Not changed:** `GlobalExceptionHandler`, `LinkResponse`, schema/migrations and security configuration (none exists in the codebase).
++
++**Why `InvalidUrlException` and not `ResponseStatusException` or `@Min`/`@Max`:** `InvalidUrlException` is already mapped to a 400 problem detail. The alternatives are not shown to be handled by `GlobalExceptionHandler` and could fall into its catch-all handler as a 500.
++
++**Visibility coupling:** the list intentionally applies no filter, because `LinkService.get()` returns every persisted link. If `GET /api/v1/links/{code}` ever starts rejecting some links (for example, returning 404 or 410 for expired links), this list query must gain the same predicate to keep FR-5 parity.
++
++### Files changed
++
++- `src/main/java/io/agentic/shortener/repository/LinkRepository.java`
++- `src/main/java/io/agentic/shortener/service/LinkService.java`
++- `src/main/java/io/agentic/shortener/web/LinkController.java`
++- `src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java`
++- `src/test/java/io/agentic/shortener/web/LinkListAccessParityTest.java`
++- `src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java`
++
++### Tests
++
++- **`LinkRepositoryRecentLinksTest`** covers:
++  - ordering by `createdAt` rather than insertion order
++  - the deterministic tie-break
++  - the bounded row count
++  - the empty result
++  - inclusion of inactive and expired links
++- **`LinkListAccessParityTest`** checks that the list endpoint gets the same unauthenticated 200 as `GET /api/v1/links/{code}`.
++- **`LinkListApiIntegrationTest`** (MockMvc) covers:
++  - array shape and ordering, including non-increasing `createdAt`
++  - the empty `[]` result
++  - default, explicit, `1` and `100` limits
++  - rejection of `0`, `101`, `-1`, `abc`, `1.5` and an empty value, each with no link data and no side effects
++  - JSON equality with `GET /api/v1/links/{code}`
++  - visibility parity: 30 links with the 10 newest deactivated or expired, and `limit=20`
++  - identical results for two callers
++
++**Note for reviewers:** the design (D6) called for a single integration test class. The implementation adds three test classes, including a repository-level test. Confirm this deviation is acceptable.
+--- a/src/main/java/io/agentic/shortener/repository/LinkRepository.java
++++ b/src/main/java/io/agentic/shortener/repository/LinkRepository.java
+@@ -1,7 +1,9 @@
+ package io.agentic.shortener.repository;
+ 
+ import io.agentic.shortener.domain.Link;
++import java.util.List;
+ import java.util.Optional;
++import org.springframework.data.domain.Limit;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.data.jpa.repository.Modifying;
+ import org.springframework.data.jpa.repository.Query;
+@@ -15,6 +17,12 @@
+ 
+     boolean existsByCode(String code);
+ 
++    /**
++     * Newest-first listing bounded at the database level (ORDER BY created_at DESC, id DESC LIMIT n).
++     * No visibility predicate: every persisted link is retrievable via GET /api/v1/links/{code}.
++     */
++    List<Link> findAllByOrderByCreatedAtDescIdDesc(Limit limit);
++
+     /** Atomic increment: avoids lost updates under concurrent redirects without optimistic-lock retries. */
+     @Modifying(clearAutomatically = true)
+     @Query("update Link l set l.clickCount = l.clickCount + 1 where l.id = :id")
+--- a/src/main/java/io/agentic/shortener/service/LinkService.java
++++ b/src/main/java/io/agentic/shortener/service/LinkService.java
+@@ -8,12 +8,14 @@
+ import io.micrometer.core.instrument.MeterRegistry;
+ import java.time.Clock;
+ import java.time.Instant;
++import java.util.List;
+ import java.util.Locale;
+ import java.util.Objects;
+ import java.util.regex.Pattern;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.dao.DataIntegrityViolationException;
++import org.springframework.data.domain.Limit;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+@@ -22,6 +24,11 @@
+ 
+     private static final Logger log = LoggerFactory.getLogger(LinkService.class);
+     private static final Pattern ALIAS = Pattern.compile("^[A-Za-z0-9_-]{3,32}$");
++
++    /** Default number of links returned by {@link #listRecent(int)} when the caller gives no limit. */
++    public static final int DEFAULT_LIST_LIMIT = 20;
++    /** Maximum number of links a caller may request from {@link #listRecent(int)}. */
++    public static final int MAX_LIST_LIMIT = 100;
+ 
+     private final LinkRepository links;
+     private final ClickEventRepository clicks;
+@@ -71,6 +78,18 @@
+         meters.counter("shortener.links.created").increment();
+         log.info("link.created code={} custom={}", code, command.customAlias() != null);
+         return new CreateLinkResult(link, true);
++    }
++
++    /**
++     * Returns the {@code limit} most recently created links, newest first (createdAt desc, id desc).
++     * Includes exactly the links {@link #get(String)} would return, i.e. all persisted links.
++     */
++    @Transactional(readOnly = true)
++    public List<Link> listRecent(int limit) {
++        if (limit < 1 || limit > MAX_LIST_LIMIT) {
++            throw new InvalidUrlException("limit must be between 1 and " + MAX_LIST_LIMIT);
++        }
++        return links.findAllByOrderByCreatedAtDescIdDesc(Limit.of(limit));
+     }
+ 
+     @Transactional(readOnly = true)
+--- a/src/main/java/io/agentic/shortener/web/LinkController.java
++++ b/src/main/java/io/agentic/shortener/web/LinkController.java
+@@ -4,15 +4,18 @@
+ import io.agentic.shortener.service.AnalyticsService;
+ import io.agentic.shortener.service.CreateLinkCommand;
+ import io.agentic.shortener.service.CreateLinkResult;
++import io.agentic.shortener.service.InvalidUrlException;
+ import io.agentic.shortener.service.LinkService;
+ import io.agentic.shortener.web.dto.CreateLinkRequest;
+ import io.agentic.shortener.web.dto.LinkResponse;
+ import io.agentic.shortener.web.dto.LinkStatsResponse;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.validation.Valid;
+ import jakarta.validation.constraints.Size;
+ import java.net.URI;
++import java.util.List;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.validation.annotation.Validated;
+@@ -58,6 +61,26 @@
+         return ResponseEntity.created(URI.create("/api/v1/links/" + body.code())).body(body);
+     }
+ 
++    @GetMapping
++    @Operation(summary = "List the most recently created links, newest first",
++            description = "Optional limit (1-100, default 20). Returns a bare JSON array; each item has the same shape "
++                    + "as GET /api/v1/links/{code}.")
++    public List<LinkResponse> list(@RequestParam(name = "limit", required = false) Integer limit,
++                                   HttpServletRequest request) {
++        int effectiveLimit;
++        if (request.getParameter("limit") == null) {
++            effectiveLimit = LinkService.DEFAULT_LIST_LIMIT;
++        } else if (limit == null) {
++            // 'limit=' was sent with an empty value (Spring converts "" to null): reject instead of defaulting.
++            throw new InvalidUrlException("limit must be an integer between 1 and " + LinkService.MAX_LIST_LIMIT);
++        } else {
++            effectiveLimit = limit;
++        }
++        return linkService.listRecent(effectiveLimit).stream()
++                .map(link -> LinkResponse.from(link, properties.baseUrl()))
++                .toList();
++    }
++
+     @GetMapping("/{code}")
+     @Operation(summary = "Get link metadata")
+     public LinkResponse get(@PathVariable String code) {
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java
+@@ -0,0 +1,114 @@
++package io.agentic.shortener.repository;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import io.agentic.shortener.domain.Link;
++import java.time.Instant;
++import java.util.List;
++import java.util.stream.IntStream;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.data.domain.Limit;
++import org.springframework.test.context.ActiveProfiles;
++
++@SpringBootTest
++@ActiveProfiles("test")
++class LinkRepositoryRecentLinksTest {
++
++    private static final Instant BASE = Instant.parse("2024-01-01T00:00:00Z");
++
++    @Autowired
++    private LinkRepository linkRepository;
++
++    @Autowired
++    private ClickEventRepository clickEventRepository;
++
++    @BeforeEach
++    void cleanDatabase() {
++        clickEventRepository.deleteAll();
++        linkRepository.deleteAll();
++    }
++
++    @Test
++    void ordersByCreatedAtDescendingNotByInsertionOrder() {
++        linkRepository.save(newLink(2, BASE.plusSeconds(2)));
++        linkRepository.save(newLink(3, BASE.plusSeconds(3)));
++        linkRepository.save(newLink(1, BASE.plusSeconds(1)));
++
++        List<Link> result = linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(10));
++
++        assertThat(codes(result)).containsExactly(code(3), code(2), code(1));
++    }
++
++    @Test
++    void equalTimestampsAreOrderedDeterministically() {
++        Instant same = BASE.plusSeconds(100);
++        linkRepository.save(newLink(1, same));
++        linkRepository.save(newLink(2, same));
++        linkRepository.save(newLink(3, same));
++
++        List<String> first = codes(linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(10)));
++        List<String> second = codes(linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(10)));
++
++        assertThat(first).containsExactlyInAnyOrder(code(1), code(2), code(3));
++        assertThat(second).isEqualTo(first);
++    }
++
++    @Test
++    void rowCountIsBoundedByLimit() {
++        linkRepository.saveAll(IntStream.rangeClosed(1, 30).mapToObj(n -> newLink(n, BASE.plusSeconds(n))).toList());
++
++        List<Link> result = linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(7));
++
++        assertThat(result).hasSize(7);
++        assertThat(codes(result)).containsExactlyElementsOf(
++                IntStream.iterate(30, i -> i - 1).limit(7).mapToObj(LinkRepositoryRecentLinksTest::code).toList());
++    }
++
++    @Test
++    void returnsEmptyListWhenNoLinksExist() {
++        assertThat(linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(20))).isEmpty();
++    }
++
++    @Test
++    void includesInactiveAndExpiredLinksBecauseTheyAreRetrievableByCode() {
++        // 30 links; the 10 newest are deactivated or expired. All are still retrievable via GET /{code},
++        // so with the identity visibility filter the 20 newest are returned, including those 10.
++        for (int n = 1; n <= 30; n++) {
++            Instant createdAt = BASE.plusSeconds(n);
++            Link link;
++            if (n > 20 && n % 2 == 0) {
++                link = newLink(n, createdAt);
++                link.deactivate();
++            } else if (n > 20) {
++                link = new Link(code(n), url(n), createdAt, createdAt.plusSeconds(1), null);
++            } else {
++                link = newLink(n, createdAt);
++            }
++            linkRepository.save(link);
++        }
++
++        List<Link> result = linkRepository.findAllByOrderByCreatedAtDescIdDesc(Limit.of(20));
++
++        assertThat(codes(result)).containsExactlyElementsOf(
++                IntStream.iterate(30, i -> i - 1).limit(20).mapToObj(LinkRepositoryRecentLinksTest::code).toList());
++    }
++
++    private static Link newLink(int n, Instant createdAt) {
++        return new Link(code(n), url(n), createdAt, null, null);
++    }
++
++    private static String code(int n) {
++        return String.format("rep%04d", n);
++    }
++
++    private static String url(int n) {
++        return "https://example.com/repo/" + n;
++    }
++
++    private static List<String> codes(List<Link> links) {
++        return links.stream().map(Link::getCode).toList();
++    }
++}
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/web/LinkListAccessParityTest.java
+@@ -0,0 +1,53 @@
++package io.agentic.shortener.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++
++import io.agentic.shortener.domain.Link;
++import io.agentic.shortener.repository.ClickEventRepository;
++import io.agentic.shortener.repository.LinkRepository;
++import java.time.Instant;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.test.web.servlet.MockMvc;
++
++/**
++ * T3: the codebase has no security configuration, so no matcher change is needed. This test confirms that
++ * GET /api/v1/links gets exactly the same access-control outcome as GET /api/v1/links/{code}.
++ */
++@SpringBootTest
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++class LinkListAccessParityTest {
++
++    @Autowired
++    private MockMvc mockMvc;
++
++    @Autowired
++    private LinkRepository linkRepository;
++
++    @Autowired
++    private ClickEventRepository clickEventRepository;
++
++    @BeforeEach
++    void cleanDatabase() {
++        clickEventRepository.deleteAll();
++        linkRepository.deleteAll();
++    }
++
++    @Test
++    void unauthenticatedCallerGetsSameStatusFromListAsFromSingleLookup() throws Exception {
++        linkRepository.save(new Link("acc0001", "https://example.com/access",
++                Instant.parse("2024-01-01T00:00:00Z"), null, null));
++
++        int lookupStatus = mockMvc.perform(get("/api/v1/links/acc0001")).andReturn().getResponse().getStatus();
++        int listStatus = mockMvc.perform(get("/api/v1/links")).andReturn().getResponse().getStatus();
++
++        assertThat(lookupStatus).as("GET /api/v1/links/{code} is unauthenticated").isEqualTo(200);
++        assertThat(listStatus).as("GET /api/v1/links mirrors GET /api/v1/links/{code}").isEqualTo(lookupStatus);
++    }
++}
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java
+@@ -0,0 +1,254 @@
++package io.agentic.shortener.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import io.agentic.shortener.domain.Link;
++import io.agentic.shortener.repository.ClickEventRepository;
++import io.agentic.shortener.repository.LinkRepository;
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.stream.IntStream;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
++
++@SpringBootTest
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++class LinkListApiIntegrationTest {
++
++    private static final Instant BASE = Instant.parse("2024-01-01T00:00:00Z");
++
++    @Autowired
++    private MockMvc mockMvc;
++
++    @Autowired
++    private ObjectMapper objectMapper;
++
++    @Autowired
++    private LinkRepository linkRepository;
++
++    @Autowired
++    private ClickEventRepository clickEventRepository;
++
++    @BeforeEach
++    void cleanDatabase() {
++        clickEventRepository.deleteAll();
++        linkRepository.deleteAll();
++    }
++
++    @Test
++    void returnsTopLevelArrayOrderedNewestFirst() throws Exception {
++        seed(2);
++        seed(3);
++        seed(1);
++
++        JsonNode body = list(get("/api/v1/links"));
++
++        assertThat(codes(body)).containsExactly(code(3), code(2), code(1));
++        assertNonIncreasingCreatedAt(body);
++    }
++
++    @Test
++    void returnsEmptyArrayWhenNoLinksExist() throws Exception {
++        JsonNode body = list(get("/api/v1/links"));
++
++        assertThat(body.size()).isZero();
++    }
++
++    @Test
++    void defaultLimitReturnsTwentyNewest() throws Exception {
++        seedRange(1, 25);
++
++        JsonNode body = list(get("/api/v1/links"));
++
++        assertThat(codes(body)).containsExactlyElementsOf(newest(25, 20));
++        assertNonIncreasingCreatedAt(body);
++    }
++
++    @Test
++    void explicitLimitReturnsThatManyNewest() throws Exception {
++        seedRange(1, 25);
++
++        JsonNode body = list(get("/api/v1/links").param("limit", "5"));
++
++        assertThat(codes(body)).containsExactlyElementsOf(newest(25, 5));
++    }
++
++    @Test
++    void limitLargerThanAvailableReturnsAll() throws Exception {
++        seedRange(1, 3);
++
++        JsonNode body = list(get("/api/v1/links").param("limit", "10"));
++
++        assertThat(codes(body)).containsExactlyElementsOf(newest(3, 3));
++    }
++
++    @Test
++    void limitOneIsAccepted() throws Exception {
++        seedRange(1, 3);
++
++        JsonNode body = list(get("/api/v1/links").param("limit", "1"));
++
++        assertThat(body.size()).isLessThanOrEqualTo(1);
++        assertThat(codes(body)).containsExactly(code(3));
++    }
++
++    @Test
++    void limitOneHundredReturnsHundredNewestOfOneHundredFifty() throws Exception {
++        seedRange(1, 150);
++
++        JsonNode body = list(get("/api/v1/links").param("limit", "100"));
++
++        assertThat(codes(body)).containsExactlyElementsOf(newest(150, 100));
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"0", "101", "-1", "abc", "1.5", ""})
++    void invalidLimitIsRejectedWithProblemDetail(String value) throws Exception {
++        seed(1);
++        long before = linkRepository.count();
++
++        String json = mockMvc.perform(get("/api/v1/links").param("limit", value))
++                .andExpect(status().isBadRequest())
++                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
++                .andExpect(jsonPath("$.status").value(400))
++                .andExpect(jsonPath("$.title").isNotEmpty())
++                .andReturn().getResponse().getContentAsString();
++
++        assertThat(objectMapper.readTree(json).isObject()).isTrue();
++        assertThat(json).doesNotContain(code(1)).doesNotContain(url(1));
++        assertThat(linkRepository.count()).isEqualTo(before);
++    }
++
++    @Test
++    void eachItemIsJsonEqualToSingleLinkLookup() throws Exception {
++        seed(1);
++        seedExpired(2);
++        seedInactive(3);
++
++        JsonNode body = list(get("/api/v1/links"));
++
++        assertThat(body.size()).isEqualTo(3);
++        for (JsonNode item : body) {
++            String single = mockMvc.perform(get("/api/v1/links/" + item.get("code").asText()))
++                    .andExpect(status().isOk())
++                    .andReturn().getResponse().getContentAsString();
++            assertThat(item).isEqualTo(objectMapper.readTree(single));
++        }
++    }
++
++    @Test
++    void listContainsExactlyTheLinksRetrievableByCodeAndLimitAppliesAfterVisibility() throws Exception {
++        seedRange(1, 20);
++        for (int n = 21; n <= 30; n++) {
++            if (n % 2 == 0) {
++                seedInactive(n);
++            } else {
++                seedExpired(n);
++            }
++        }
++        for (int n = 21; n <= 30; n++) {
++            mockMvc.perform(get("/api/v1/links/" + code(n))).andExpect(status().isOk());
++        }
++
++        JsonNode limited = list(get("/api/v1/links").param("limit", "20"));
++        assertThat(codes(limited)).containsExactlyElementsOf(newest(30, 20));
++
++        JsonNode all = list(get("/api/v1/links").param("limit", "100"));
++        assertThat(codes(all)).containsExactlyElementsOf(newest(30, 30));
++    }
++
++    @Test
++    void differentCallersReceiveTheSameList() throws Exception {
++        seedRange(1, 5);
++
++        JsonNode first = list(get("/api/v1/links").header("User-Agent", "caller-a")
++                .with(request -> {
++                    request.setRemoteAddr("10.0.0.1");
++                    return request;
++                }));
++        JsonNode second = list(get("/api/v1/links").header("User-Agent", "caller-b")
++                .with(request -> {
++                    request.setRemoteAddr("10.0.0.2");
++                    return request;
++                }));
++
++        assertThat(second).isEqualTo(first);
++    }
++
++    private JsonNode list(MockHttpServletRequestBuilder request) throws Exception {
++        String json = mockMvc.perform(request)
++                .andExpect(status().isOk())
++                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
++                .andReturn().getResponse().getContentAsString();
++        JsonNode body = objectMapper.readTree(json);
++        assertThat(body.isArray()).as("top-level JSON array").isTrue();
++        return body;
++    }
++
++    private void assertNonIncreasingCreatedAt(JsonNode body) {
++        List<String> codes = codes(body);
++        for (int i = 0; i + 1 < codes.size(); i++) {
++            Instant earlier = linkRepository.findByCode(codes.get(i)).orElseThrow().getCreatedAt();
++            Instant later = linkRepository.findByCode(codes.get(i + 1)).orElseThrow().getCreatedAt();
++            assertThat(earlier).isAfterOrEqualTo(later);
++        }
++    }
++
++    private Link seed(int n) {
++        return linkRepository.save(newLink(n));
++    }
++
++    private Link seedExpired(int n) {
++        Instant createdAt = BASE.plusSeconds(n);
++        return linkRepository.save(new Link(code(n), url(n), createdAt, createdAt.plusSeconds(1), null));
++    }
++
++    private Link seedInactive(int n) {
++        Link link = newLink(n);
++        link.deactivate();
++        return linkRepository.save(link);
++    }
++
++    private void seedRange(int from, int to) {
++        linkRepository.saveAll(IntStream.rangeClosed(from, to).mapToObj(LinkListApiIntegrationTest::newLink).toList());
++    }
++
++    private static Link newLink(int n) {
++        return new Link(code(n), url(n), BASE.plusSeconds(n), null, null);
++    }
++
++    private static String code(int n) {
++        return String.format("lst%04d", n);
++    }
++
++    private static String url(int n) {
++        return "https://example.com/page/" + n;
++    }
++
++    private static List<String> newest(int highest, int count) {
++        return IntStream.iterate(highest, i -> i - 1).limit(count).mapToObj(LinkListApiIntegrationTest::code).toList();
++    }
++
++    private static List<String> codes(JsonNode array) {
++        List<String> result = new ArrayList<>();
++        array.forEach(node -> result.add(node.get("code").asText()));
++        return result;
++    }
++}

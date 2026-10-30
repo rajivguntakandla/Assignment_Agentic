@@ -1,0 +1,39 @@
+{
+  "run_status": "completed",
+  "stage_executions": 8,
+  "stage_success_rate": 1.0,
+  "stage_failures": 0,
+  "retries": 3,
+  "retries_by_scope": {
+    "llm": 3
+  },
+  "retry_frequency": 0.375,
+  "rollbacks": 0,
+  "rollback_frequency": 0.0,
+  "fallbacks": 1,
+  "replans": 0,
+  "safe_stops": 1,
+  "approvals": 2,
+  "policy_findings": 1,
+  "mttr_s": 0.066,
+  "recoveries": 1,
+  "e2e_latency_s": 11.239,
+  "human_wait_s": 9.364,
+  "active_latency_s": 1.875,
+  "llm_calls": 8,
+  "llm_calls_by_provider": {
+    "replay": 4
+  },
+  "llm_latency_p50_s": 0.0,
+  "llm_latency_p95_s": 0.001,
+  "stage_latency_p50_s": {
+    "design": 0.487,
+    "documentation": 0.008,
+    "implementation": 0.072,
+    "planning": 1.159,
+    "release": 0.02,
+    "requirements": 0.003,
+    "security_review": 0.022,
+    "verification": 9.356
+  }
+}

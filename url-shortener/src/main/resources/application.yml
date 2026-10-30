@@ -1,0 +1,44 @@
+spring:
+  application:
+    name: url-shortener
+  datasource:
+    url: ${DATABASE_URL:jdbc:h2:file:./data/shortener;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;AUTO_SERVER=TRUE}
+    username: ${DATABASE_USER:sa}
+    password: ${DATABASE_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+server:
+  error:
+    include-stacktrace: never
+    include-message: never
+
+shortener:
+  base-url: ${SHORTENER_BASE_URL:http://localhost:8080}
+  code-length: 7
+  max-url-length: 2048
+  max-code-generation-attempts: 5
+  visitor-hash-salt: ${SHORTENER_VISITOR_SALT:change-me-in-production}
+  reserved-codes: [api, actuator, swagger-ui, v3, health, admin, static]
+  rate-limit:
+    enabled: true
+    capacity: 20
+    refill-per-minute: 20
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html

@@ -1,0 +1,355 @@
+# AMBIGUOUS: a vague product request ("safer", "bad links", no acceptance criteria).
+# Demonstrates: deterministic + LLM ambiguity detection -> human clarification checkpoint -> requirement re-derived
+# from the answers (upstream output changed -> downstream re-plan), security-sensitive design -> human design review
+# that REJECTS revision 1 (label-boundary bug in the matching rule) -> revised design -> approval, configuration
+# change that requires explicit acknowledgement at release.
+id: ambiguous
+kind: ambiguous
+title: Safer short links
+requirement: >-
+  Make our short links safer for users - we keep getting complaints about bad links.
+
+clarifications:
+  - decision: approve
+    approver: product-owner@shortener-team
+    answers:
+      safer: >-
+        Prevent creating short links to destinations on an operator-maintained denylist of domains; subdomains of a
+        listed domain are blocked too and matching is case-insensitive.
+      bad: >-
+        A domain listed in the shortener.blocked-domains configuration property (empty by default). No external
+        reputation service in this iteration.
+      acceptance: >-
+        Creating a link to a blocked domain or any of its subdomains returns HTTP 400 with a problem detail; other
+        domains, including look-alikes such as notevil.example for evil.example, are unaffected; existing links are
+        not changed retroactively.
+
+approvals:
+  design_approval:
+    - decision: reject
+      approver: security-architect@shortener-team
+      comment: >-
+        Suffix matching must respect DNS label boundaries: with evil.example blocked, notevil.example must stay
+        allowed. Make the rule explicit in the design and cover it with tests.
+    - decision: approve
+      approver: security-architect@shortener-team
+      comment: Label-boundary matching and normalisation are now explicit and tested. Approved.
+  release_approval:
+    - decision: approve
+      approver: tech-lead@shortener-team
+      acknowledged_findings: true
+      comment: >-
+        application.yml change acknowledged (adds an empty default denylist only). Validator change reviewed.
+
+recordings:
+  requirements:
+    # Variant 1: before clarification - the analyst cannot produce testable criteria and escalates.
+    - title: Safer short links
+      intent: Reduce user harm from short links that lead to malicious or unwanted destinations.
+      kind: ambiguous
+      functional_requirements:
+        - id: FR-1
+          text: Prevent short links from pointing at harmful destinations (definition pending clarification).
+          acceptance_criteria:
+            - To be defined with the product owner - 'safer' and 'bad links' are not measurable as stated.
+      domain_terms: [UrlValidator, LinkService]
+      assumptions: []
+      ambiguities:
+        - term: safer
+          question: Which harm should be prevented - phishing/malware destinations, spam, or something else?
+          proposed_default: Block destinations on a configurable domain denylist.
+        - term: bad
+          question: Who decides that a link is bad, and is there an existing list or reputation feed?
+          proposed_default: An operator-maintained configuration list; no external feed.
+      needs_clarification: true
+    # Variant 2: after the product owner's answers.
+    - title: Domain denylist for link creation
+      intent: Refuse to shorten URLs whose host is on an operator-maintained denylist (or a subdomain of one).
+      kind: ambiguous
+      functional_requirements:
+        - id: FR-1
+          text: A configurable denylist shortener.blocked-domains (empty by default) defines blocked domains.
+          acceptance_criteria:
+            - With no configuration, no domain is blocked and existing behaviour is unchanged.
+            - Entries are normalised (trimmed, lower-cased, trailing dot removed).
+        - id: FR-2
+          text: Creating a link whose host equals a blocked domain or is a subdomain of it is rejected with HTTP 400.
+          acceptance_criteria:
+            - With evil.example blocked, https://login.evil.example/reset returns 400 with a problem detail.
+            - Matching is case-insensitive (EVIL.example is blocked).
+        - id: FR-3
+          text: Domains that merely contain a blocked name are unaffected; existing links are not modified.
+          acceptance_criteria:
+            - With evil.example blocked, notevil.example and evil.example.com can still be shortened (201).
+      non_functional_requirements:
+        - Validation adds no network calls (no DNS or reputation lookups) on the create path.
+      domain_terms: [UrlValidator, ShortenerProperties, blocked, domain]
+      assumptions:
+        - Redirects of already-created links are out of scope (no retroactive blocking).
+      out_of_scope:
+        - External reputation feeds (e.g. Safe Browsing)
+        - Retroactive deactivation of existing links
+      ambiguities: []
+      needs_clarification: false
+
+  planning:
+    - rationale: >-
+        Configuration (property + default) is independent and goes first in parallel; validator logic depends on
+        the property; tests depend on both; docs last.
+      tasks:
+        - {id: T1, title: Add blockedDomains to ShortenerProperties with normalisation, kind: config, depends_on: [],
+           requirement_ids: [FR-1], files: [src/main/java/io/agentic/shortener/config/ShortenerProperties.java]}
+        - {id: T2, title: Default empty denylist in application.yml, kind: config, depends_on: [], requirement_ids: [FR-1],
+           files: [src/main/resources/application.yml]}
+        - {id: T3, title: Label-boundary domain check in UrlValidator, kind: code, depends_on: [T1], requirement_ids: [FR-2, FR-3],
+           files: [src/main/java/io/agentic/shortener/service/UrlValidator.java]}
+        - {id: T4, title: Unit + integration tests incl. look-alike domains, kind: test, depends_on: [T2, T3],
+           requirement_ids: [FR-1, FR-2, FR-3],
+           files: [src/test/java/io/agentic/shortener/service/UrlValidatorTest.java,
+                   src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java]}
+        - {id: T5, title: Feature documentation and changelog, kind: docs, depends_on: [T4], requirement_ids: [], files: []}
+
+  design:
+    # Revision 1 - rejected by the security architect (suffix match without label boundary).
+    - summary: >-
+        Add shortener.blocked-domains to the configuration record and reject hosts that end with a blocked domain
+        in UrlValidator, reusing the existing InvalidUrlException -> 400 problem-detail mapping.
+      decisions:
+        - id: D1
+          decision: Enforce the denylist in UrlValidator (single validation choke point for every create path)
+          rationale: All creation paths already call UrlValidator; no new wiring and no duplicated checks.
+          alternatives: [Servlet filter (sees raw JSON, wrong layer), Separate service (extra wiring)]
+        - id: D2
+          decision: Match with host.endsWith(blockedDomain)
+          rationale: Covers subdomains with a single comparison.
+          alternatives: [Exact match only (misses subdomains)]
+      api_changes: ["POST /api/v1/links: new 400 reason 'Links to this domain are blocked by policy'"]
+      schema_changes: []
+      planned_files: &ambiguous_files
+        - src/main/java/io/agentic/shortener/config/ShortenerProperties.java
+        - src/main/resources/application.yml
+        - src/main/java/io/agentic/shortener/service/UrlValidator.java
+        - src/test/java/io/agentic/shortener/service/UrlValidatorTest.java
+        - src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java
+      risks:
+        - Configuration-only list; operators must maintain it.
+    # Revision 2 - addresses the review feedback.
+    - summary: >-
+        Add shortener.blocked-domains (normalised at bind time) and reject hosts that equal a blocked domain or end
+        with "." + blocked domain, i.e. matching on DNS label boundaries. Reuses InvalidUrlException -> 400.
+      decisions:
+        - id: D1
+          decision: Enforce the denylist in UrlValidator (single validation choke point for every create path)
+          rationale: All creation paths already call UrlValidator; no new wiring and no duplicated checks.
+          alternatives: [Servlet filter (sees raw JSON, wrong layer), Separate service (extra wiring)]
+        - id: D2
+          decision: Match host == d or host.endsWith("." + d) (DNS label boundary), after lower-casing and trimming a trailing dot
+          rationale: >-
+            Blocks every subdomain while leaving look-alikes such as notevil.example untouched (review feedback);
+            normalisation prevents EVIL.example and trailing-dot bypasses.
+          alternatives: [Plain endsWith (false positives on look-alikes), Public-suffix aware registrable-domain matching (needs a dependency)]
+        - id: D3
+          decision: Normalise entries once in the configuration record's compact constructor
+          rationale: The hot path compares pre-normalised strings; invalid/blank entries are dropped at startup.
+          alternatives: [Normalise on every request]
+        - id: D4
+          decision: No DNS resolution or external lookups
+          rationale: Keeps the create path fast and deterministic; DNS answers are attacker-controlled anyway.
+          alternatives: [Resolve and block IP ranges (slow, rebinding-prone)]
+      api_changes: ["POST /api/v1/links: new 400 reason 'Links to this domain are blocked by policy'"]
+      schema_changes: []
+      planned_files: *ambiguous_files
+      risks:
+        - Denylists are reactive; new malicious domains pass until listed.
+        - Existing links to newly blocked domains keep redirecting (explicitly out of scope).
+        - Changing the list requires a restart (no hot reload in this iteration).
+
+  implementation:
+    - summary: Configurable domain denylist with label-boundary matching enforced in UrlValidator, with tests.
+      changes:
+        - path: src/main/java/io/agentic/shortener/config/ShortenerProperties.java
+          action: modify
+          task_id: T1
+          edits:
+            - search: "import java.util.List;"
+              replace: |2-
+                import java.util.List;
+                import java.util.Locale;
+            - search: "        RateLimit rateLimit) {"
+              replace: |2-
+                        RateLimit rateLimit,
+                        List<String> blockedDomains) {
+            - search: "        rateLimit = rateLimit == null ? new RateLimit(true, 20, 20) : rateLimit;"
+              replace: |2-
+                        rateLimit = rateLimit == null ? new RateLimit(true, 20, 20) : rateLimit;
+                        blockedDomains = blockedDomains == null ? List.of() : blockedDomains.stream()
+                                .map(d -> d.trim().toLowerCase(Locale.ROOT))
+                                .map(d -> d.endsWith(".") ? d.substring(0, d.length() - 1) : d)
+                                .filter(d -> !d.isEmpty())
+                                .distinct()
+                                .toList();
+        - path: src/main/resources/application.yml
+          action: modify
+          task_id: T2
+          edits:
+            - search: "  reserved-codes: [api, actuator, swagger-ui, v3, health, admin, static]"
+              replace: |2-
+                  reserved-codes: [api, actuator, swagger-ui, v3, health, admin, static]
+                  # Operator-maintained denylist; subdomains of listed domains are blocked as well.
+                  blocked-domains: []
+        - path: src/main/java/io/agentic/shortener/service/UrlValidator.java
+          action: modify
+          task_id: T3
+          edits:
+            - search: |2-
+                        if (host.equals(ownHost)) {
+                            throw new InvalidUrlException("URLs pointing back to this shortener are not allowed");
+                        }
+              replace: |2-
+                        if (host.equals(ownHost)) {
+                            throw new InvalidUrlException("URLs pointing back to this shortener are not allowed");
+                        }
+                        if (isBlockedDomain(host)) {
+                            throw new InvalidUrlException("Links to this domain are blocked by policy");
+                        }
+            - search: "    static boolean isInternalHost(String host) {"
+              replace: |2-
+                    /** Exact domain or any subdomain, on DNS label boundaries: "notevil.example" does not match "evil.example". */
+                    boolean isBlockedDomain(String host) {
+                        String normalized = host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
+                        for (String blocked : properties.blockedDomains()) {
+                            if (normalized.equals(blocked) || normalized.endsWith("." + blocked)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
+                    static boolean isInternalHost(String host) {
+        - path: src/test/java/io/agentic/shortener/service/UrlValidatorTest.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: '            "https://sho.rt", 7, 100, 5, "salt", List.of(), null));'
+              replace: |2-
+                            "https://sho.rt", 7, 100, 5, "salt", List.of(), null, List.of("evil.example", " Phish.TEST. ")));
+            - search: |2-
+                    @Test
+                    void rejectsBlankAndOverlongUrls() {
+              replace: |2-
+                    @ParameterizedTest
+                    @ValueSource(strings = {
+                            "https://evil.example/login",
+                            "https://EVIL.example",
+                            "https://login.evil.example/path",
+                            "http://a.b.phish.test/"})
+                    void rejectsBlockedDomainsAndTheirSubdomains(String url) {
+                        assertThatThrownBy(() -> validator.validate(url))
+                                .isInstanceOf(InvalidUrlException.class)
+                                .hasMessageContaining("blocked");
+                    }
+
+                    @ParameterizedTest
+                    @ValueSource(strings = {"https://notevil.example", "https://evil.example.com", "https://phish.testing.org"})
+                    void allowsLookalikeButDistinctDomains(String url) {
+                        assertThat(validator.validate(url).getHost()).isNotBlank();
+                    }
+
+                    @Test
+                    void normalisesConfiguredDomains() {
+                        assertThat(new ShortenerProperties("https://sho.rt", 7, 100, 5, "salt", null, null,
+                                List.of(" Evil.Example. ", "", "evil.example")).blockedDomains())
+                                .containsExactly("evil.example");
+                    }
+
+                    @Test
+                    void rejectsBlankAndOverlongUrls() {
+        - path: src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java
+          action: create
+          task_id: T4
+          content: |
+            package io.agentic.shortener.web;
+
+            import static org.hamcrest.Matchers.containsString;
+            import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+            import org.junit.jupiter.api.Test;
+            import org.springframework.beans.factory.annotation.Autowired;
+            import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+            import org.springframework.boot.test.context.SpringBootTest;
+            import org.springframework.http.MediaType;
+            import org.springframework.test.context.ActiveProfiles;
+            import org.springframework.test.web.servlet.MockMvc;
+            import org.springframework.test.web.servlet.ResultActions;
+
+            @SpringBootTest(properties = "shortener.blocked-domains=evil.example,Phish.Test")
+            @AutoConfigureMockMvc
+            @ActiveProfiles("test")
+            class BlockedDomainIntegrationTest {
+
+                @Autowired
+                MockMvc mvc;
+
+                @Test
+                void rejectsBlockedDomainAndSubdomainsWithProblemDetail() throws Exception {
+                    create("https://login.evil.example/reset")
+                            .andExpect(status().isBadRequest())
+                            .andExpect(header().string("Content-Type", containsString("application/problem+json")))
+                            .andExpect(jsonPath("$.detail").value("Links to this domain are blocked by policy"));
+                    create("https://PHISH.test/x").andExpect(status().isBadRequest());
+                }
+
+                @Test
+                void lookalikeAndOtherDomainsAreUnaffected() throws Exception {
+                    create("https://notevil.example/").andExpect(status().isCreated());
+                    create("https://evil.example.com/").andExpect(status().isCreated());
+                    create("https://example.org/").andExpect(status().isCreated());
+                }
+
+                private ResultActions create(String url) throws Exception {
+                    return mvc.perform(post("/api/v1/links").contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"url\":\"" + url + "\"}"));
+                }
+            }
+
+  documentation:
+    - feature_doc_path: docs/features/domain-denylist.md
+      changelog_entry: >-
+        Link creation now rejects destinations on the operator-maintained denylist shortener.blocked-domains
+        (including subdomains, matched on DNS label boundaries). Empty by default; existing links are unchanged.
+      api_examples:
+        - "SHORTENER_BLOCKED_DOMAINS=evil.example java -jar url-shortener.jar"
+      feature_doc: |
+        # Domain denylist
+
+        Origin: the request "make our short links safer" was clarified with the product owner into a concrete,
+        testable rule: refuse to shorten URLs that point at operator-listed domains.
+
+        ## Configuration (FR-1)
+
+        ```yaml
+        shortener:
+          blocked-domains: [evil.example, phish.test]
+        ```
+
+        Or via environment: `SHORTENER_BLOCKED_DOMAINS=evil.example,phish.test`. Entries are trimmed, lower-cased and
+        stripped of a trailing dot at startup. The default list is empty, which preserves previous behaviour.
+
+        ## Behaviour (FR-2)
+
+        `POST /api/v1/links` (and every other creation path, because the check lives in `UrlValidator`) returns `400`
+        with the problem detail `Links to this domain are blocked by policy` when the host equals a listed domain or
+        is any subdomain of it (`login.evil.example`). Matching is case-insensitive.
+
+        ## What is not blocked (FR-3)
+
+        Matching respects DNS label boundaries: with `evil.example` listed, `notevil.example` and `evil.example.com`
+        are allowed. Links created before a domain was listed keep working (no retroactive changes).
+
+        ## Limitations
+
+        - The list is static configuration; changes need a restart.
+        - No reputation feeds or DNS-based checks; a denylist only stops domains someone has already reported.

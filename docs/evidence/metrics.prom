@@ -1,0 +1,24 @@
+# HELP agentic_runs_total Runs recorded
+# TYPE agentic_runs_total gauge
+agentic_runs_total 5
+# HELP agentic_run_success_rate Finished runs that completed successfully
+# TYPE agentic_run_success_rate gauge
+agentic_run_success_rate 0.8
+# HELP agentic_stage_success_rate Stage executions that succeeded
+# TYPE agentic_stage_success_rate gauge
+agentic_stage_success_rate 0.952
+# HELP agentic_retry_frequency Retries per stage execution
+# TYPE agentic_retry_frequency gauge
+agentic_retry_frequency 0.119
+# HELP agentic_rollback_frequency Rollbacks per stage execution
+# TYPE agentic_rollback_frequency gauge
+agentic_rollback_frequency 0.095
+# HELP agentic_fallbacks_total Provider/agent fallbacks
+# TYPE agentic_fallbacks_total gauge
+agentic_fallbacks_total 1
+# HELP agentic_mttr_seconds Mean time from stage failure to recovery
+# TYPE agentic_mttr_seconds gauge
+agentic_mttr_seconds 4.603
+# HELP agentic_e2e_latency_p50_seconds Median end-to-end run latency
+# TYPE agentic_e2e_latency_p50_seconds gauge
+agentic_e2e_latency_p50_seconds 9.197

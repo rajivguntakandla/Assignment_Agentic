@@ -1,0 +1,60 @@
+name: Orchestrator CI (LangGraph)
+
+on:
+  push:
+    paths: ["orchestrator/**", "url-shortener/**", ".github/workflows/orchestrator-ci.yml"]
+  pull_request:
+    paths: ["orchestrator/**", "url-shortener/**", ".github/workflows/orchestrator-ci.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orchestrator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Unit + orchestration tests
+        run: pytest -q --cov=agentic_sdlc --cov-report=term-missing
+
+  end-to-end:
+    needs: lint-and-unit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orchestrator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: pip install -e ".[dev]"
+      - name: Scenarios against the real Maven build
+        run: pytest -m integration -q
+      - name: Full demo (all scenarios + resilience drill) and audit verification
+        env:
+          AGENTIC_HOME: ${{ runner.temp }}/runs
+        run: |
+          agentic demo --llm offline --evidence-dir "${{ runner.temp }}/evidence"
+          for run in "${{ runner.temp }}"/runs/demo-*/*/; do agentic --home "$(dirname "$run")" audit verify "$(basename "$run")"; done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orchestration-evidence
+          path: ${{ runner.temp }}/evidence/

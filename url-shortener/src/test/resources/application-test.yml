@@ -1,0 +1,13 @@
+spring:
+  main:
+    banner-mode: "off"
+  datasource:
+    url: jdbc:h2:mem:shortener-${random.uuid};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
+shortener:
+  base-url: http://sho.rt
+  visitor-hash-salt: test-salt
+  rate-limit:
+    enabled: false
+logging:
+  level:
+    root: WARN

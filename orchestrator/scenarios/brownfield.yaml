@@ -1,0 +1,711 @@
+# BROWNFIELD: an enhancement that cuts across schema, entity, repository, service and public API of existing code.
+# Demonstrates: static impact analysis over the existing codebase, high-risk classification (schema change +
+# modified public API) -> mandatory human design approval, immutable-migration policy, and a realistic defect in
+# the first generated change set that the real test suite catches -> rollback -> feedback -> rework -> green.
+id: brownfield
+kind: brownfield
+title: Click limits for short links
+requirement: >-
+  Links need an optional click limit. When creating a link, clients may set maxClicks (1 to 1,000,000). Once a
+  link has been followed maxClicks times, further redirects must return HTTP 410 Gone, and the link metadata must
+  expose maxClicks and remainingClicks. Existing links without a limit must behave exactly as before.
+
+approvals:
+  design_approval:
+    - decision: approve
+      approver: architect@shortener-team
+      comment: >-
+        Nullable column + new V2 migration keeps existing rows valid. Conditional UPDATE for the limit is the right
+        call for concurrency. Approved.
+  release_approval:
+    - decision: approve
+      approver: tech-lead@shortener-team
+      comment: Off-by-one from round 1 was caught by tests and fixed; boundary test now covers the limit exactly.
+
+recordings:
+  requirements:
+    - title: Click limits for short links
+      intent: Allow single-use or limited-use links that stop redirecting after a configured number of clicks.
+      kind: brownfield
+      functional_requirements:
+        - id: FR-1
+          text: POST /api/v1/links accepts an optional maxClicks between 1 and 1,000,000.
+          acceptance_criteria:
+            - maxClicks=2 is stored and echoed in the 201 response together with remainingClicks=2.
+            - maxClicks=0, negative values and values above 1,000,000 are rejected with HTTP 400.
+        - id: FR-2
+          text: A link with maxClicks=N redirects exactly N times; every later redirect returns HTTP 410 Gone.
+          acceptance_criteria:
+            - With maxClicks=2 the first two GET /{code} return 302 and the third returns 410.
+            - Refused redirects are not counted as clicks.
+        - id: FR-3
+          text: Link metadata exposes maxClicks and remainingClicks.
+          acceptance_criteria:
+            - After two clicks on a maxClicks=2 link, GET /api/v1/links/{code} returns clickCount=2 and remainingClicks=0.
+        - id: FR-4
+          text: Links without maxClicks behave exactly as before (unlimited).
+          acceptance_criteria:
+            - A link without maxClicks keeps redirecting (302) after many clicks and reports maxClicks=null.
+            - Idempotent replays must match maxClicks; a different maxClicks under the same Idempotency-Key returns 409.
+      non_functional_requirements:
+        - The limit must hold under concurrent redirects (no overshoot).
+        - Backward-compatible schema migration; existing rows remain valid.
+      domain_terms: [Link, maxClicks, clickCount, redirect, LinkService, LinkRepository, CreateLinkRequest, LinkResponse]
+      assumptions:
+        - Deactivation and expiry keep their precedence; the click limit is an additional reason for 410.
+      out_of_scope:
+        - Changing the limit of an existing link (PATCH)
+      ambiguities: []
+      needs_clarification: false
+
+  planning:
+    - rationale: >-
+        Schema first (immutable V1, new V2), then the entity, then API/command types that depend on the entity
+        accessors, then the service logic that ties them together, then tests. Strictly sequential because each
+        layer compiles against the previous one.
+      tasks:
+        - {id: T1, title: Flyway V2 migration adding nullable max_clicks with check constraint, kind: migration,
+           depends_on: [], requirement_ids: [FR-1, FR-4], files: [src/main/resources/db/migration/V2__add_link_max_clicks.sql]}
+        - {id: T2, title: Link entity field, constructor and remainingClicks, kind: code, depends_on: [T1],
+           requirement_ids: [FR-1, FR-3], files: [src/main/java/io/agentic/shortener/domain/Link.java]}
+        - {id: T3, title: Race-free conditional increment in LinkRepository, kind: code, depends_on: [T2],
+           requirement_ids: [FR-2], files: [src/main/java/io/agentic/shortener/repository/LinkRepository.java]}
+        - {id: T4, title: Request/command/response API fields, kind: code, depends_on: [T2], requirement_ids: [FR-1, FR-3],
+           files: [src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java,
+                   src/main/java/io/agentic/shortener/service/CreateLinkCommand.java,
+                   src/main/java/io/agentic/shortener/web/dto/LinkResponse.java,
+                   src/main/java/io/agentic/shortener/web/LinkController.java]}
+        - {id: T5, title: Enforce limit in LinkService redirect path; idempotency comparison, kind: code, depends_on: [T3, T4],
+           requirement_ids: [FR-2, FR-4], files: [src/main/java/io/agentic/shortener/service/LinkService.java]}
+        - {id: T6, title: Integration tests for limits, boundaries and backward compatibility, kind: test, depends_on: [T5],
+           requirement_ids: [FR-1, FR-2, FR-3, FR-4], files: [src/test/java/io/agentic/shortener/web/MaxClicksIntegrationTest.java]}
+        - {id: T7, title: Feature documentation and changelog, kind: docs, depends_on: [T6], requirement_ids: [], files: []}
+
+  design:
+    - summary: >-
+        Add a nullable max_clicks column (new Flyway V2 migration) and enforce the limit in the redirect path with a
+        single conditional UPDATE (increment only while click_count < max_clicks). Unlimited links keep the
+        existing code path unchanged. API gains maxClicks (request) and maxClicks/remainingClicks (response).
+      decisions:
+        - id: D1
+          decision: New migration V2 adds nullable max_clicks INTEGER with CHECK (max_clicks > 0)
+          rationale: Applied migrations are immutable; NULL means unlimited, so every existing row stays valid (FR-4).
+          alternatives: [Edit V1 (breaks Flyway checksums in deployed environments), NOT NULL with sentinel value]
+        - id: D2
+          decision: Enforce the limit with a conditional UPDATE ... WHERE click_count < max_clicks and check the row count
+          rationale: Check and increment are one atomic statement, so concurrent redirects cannot overshoot the limit.
+          alternatives: [Read-check-write in Java (races), Optimistic locking with retries (contention on hot links)]
+        - id: D3
+          decision: Keep the unlimited path byte-for-byte equivalent and isolate the new branch
+          rationale: Minimises regression risk for the existing behaviour (FR-4) and keeps analytics failure isolation.
+          alternatives: [Single unified path (simpler code, larger behavioural blast radius)]
+        - id: D4
+          decision: Return 410 Gone (LinkGoneException) when the limit is reached
+          rationale: Same semantics clients already handle for expired and deactivated links.
+          alternatives: [404 Not Found (hides that the link existed), 429 (wrong semantics)]
+      api_changes:
+        - "POST /api/v1/links: optional request field maxClicks (1..1,000,000)"
+        - "Link responses: new fields maxClicks, remainingClicks (nullable)"
+        - "GET /{code}: 410 when the click limit is reached"
+      schema_changes: ["links.max_clicks INTEGER NULL, CHECK (max_clicks IS NULL OR max_clicks > 0)"]
+      planned_files:
+        - src/main/resources/db/migration/V2__add_link_max_clicks.sql
+        - src/main/java/io/agentic/shortener/domain/Link.java
+        - src/main/java/io/agentic/shortener/repository/LinkRepository.java
+        - src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java
+        - src/main/java/io/agentic/shortener/service/CreateLinkCommand.java
+        - src/main/java/io/agentic/shortener/web/dto/LinkResponse.java
+        - src/main/java/io/agentic/shortener/web/LinkController.java
+        - src/main/java/io/agentic/shortener/service/LinkService.java
+        - src/test/java/io/agentic/shortener/web/MaxClicksIntegrationTest.java
+      risks:
+        - Additive response fields could break clients that use strict deserialisation (unknown properties).
+        - The limited path records the click event after the counter update; an analytics failure there leaves the
+          counter incremented without an event (counter remains authoritative for the limit).
+        - Hot single-use links serialise on one row update; acceptable at prototype scale.
+
+  implementation:
+    # Round 1: realistic defect - the conditional UPDATE uses <= instead of <, allowing one redirect too many.
+    - summary: Add maxClicks end-to-end (migration, entity, repository, API, service enforcement) with tests.
+      changes:
+        - path: src/main/resources/db/migration/V2__add_link_max_clicks.sql
+          action: create
+          task_id: T1
+          content: |
+            ALTER TABLE links ADD COLUMN max_clicks INTEGER;
+            ALTER TABLE links ADD CONSTRAINT ck_links_max_clicks CHECK (max_clicks IS NULL OR max_clicks > 0);
+        - path: src/main/java/io/agentic/shortener/domain/Link.java
+          action: modify
+          task_id: T2
+          edits:
+            - search: |2-
+                    @Version
+                    private long version;
+              replace: |2-
+                    @Column(name = "max_clicks")
+                    private Integer maxClicks;
+
+                    @Version
+                    private long version;
+            - search: |2-
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey) {
+                        this.code = code;
+              replace: |2-
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey) {
+                        this(code, targetUrl, createdAt, expiresAt, idempotencyKey, null);
+                    }
+
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey,
+                                Integer maxClicks) {
+                        this.maxClicks = maxClicks;
+                        this.code = code;
+            - search: |2-
+                    public long getClickCount() {
+                        return clickCount;
+                    }
+              replace: |2-
+                    public long getClickCount() {
+                        return clickCount;
+                    }
+
+                    public Integer getMaxClicks() {
+                        return maxClicks;
+                    }
+
+                    /** {@code null} when the link has no click limit. */
+                    public Long getRemainingClicks() {
+                        return maxClicks == null ? null : Math.max(0L, maxClicks - clickCount);
+                    }
+        - path: src/main/java/io/agentic/shortener/repository/LinkRepository.java
+          action: modify
+          task_id: T3
+          edits:
+            - search: |2-
+                    int incrementClickCount(@Param("id") Long id);
+              replace: |2-
+                    int incrementClickCount(@Param("id") Long id);
+
+                    /** Conditional increment for limited links; returns 0 once the limit is reached (race-free). */
+                    @Modifying(clearAutomatically = true)
+                    @Query("update Link l set l.clickCount = l.clickCount + 1 where l.id = :id and l.clickCount <= l.maxClicks")
+                    int incrementClickCountWithinLimit(@Param("id") Long id);
+        - path: src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "import jakarta.validation.constraints.NotBlank;"
+              replace: |2-
+                import jakarta.validation.constraints.Max;
+                import jakarta.validation.constraints.Min;
+                import jakarta.validation.constraints.NotBlank;
+            - search: "        Instant expiresAt) {"
+              replace: |2-
+                        Instant expiresAt,
+                        @Schema(description = "Optional click limit; redirects return 410 Gone once reached", example = "100")
+                        @Min(1) @Max(1_000_000) Integer maxClicks) {
+        - path: src/main/java/io/agentic/shortener/service/CreateLinkCommand.java
+          action: modify
+          task_id: T4
+          content: |
+            package io.agentic.shortener.service;
+
+            import java.time.Instant;
+
+            /** Service-layer input, decoupled from the HTTP DTO. {@code maxClicks == null} means unlimited. */
+            public record CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey,
+                                            Integer maxClicks) {
+
+                public CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey) {
+                    this(url, customAlias, expiresAt, idempotencyKey, null);
+                }
+            }
+        - path: src/main/java/io/agentic/shortener/web/dto/LinkResponse.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "        long clickCount) {"
+              replace: |2-
+                        long clickCount,
+                        Integer maxClicks,
+                        Long remainingClicks) {
+            - search: "link.isActive(), link.getClickCount());"
+              replace: |2-
+                link.isActive(), link.getClickCount(), link.getMaxClicks(),
+                                link.getRemainingClicks());
+        - path: src/main/java/io/agentic/shortener/web/LinkController.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey));"
+              replace: |2-
+                new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey,
+                                        request.maxClicks()));
+        - path: src/main/java/io/agentic/shortener/service/LinkService.java
+          action: modify
+          task_id: T5
+          edits:
+            - search: "        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey());"
+              replace: |2-
+                        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey(),
+                                command.maxClicks());
+            - search: "                && Objects.equals(command.expiresAt(), existing.getExpiresAt());"
+              replace: |2-
+                                && Objects.equals(command.expiresAt(), existing.getExpiresAt())
+                                && Objects.equals(command.maxClicks(), existing.getMaxClicks());
+            - search: |2-
+                        try {
+                            clicks.save(new ClickEvent(link, now, referrerHost(referrer), visitorHasher.hash(clientAddress, userAgent)));
+                            links.incrementClickCount(link.getId());
+                        } catch (RuntimeException e) {
+                            log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                            meters.counter("shortener.analytics.failures").increment();
+                        }
+              replace: |2-
+                        if (link.getMaxClicks() != null) {
+                            // Limit check + increment in one conditional UPDATE: no overshoot under concurrent redirects.
+                            if (links.incrementClickCountWithinLimit(link.getId()) == 0) {
+                                meters.counter("shortener.redirects", "outcome", "gone").increment();
+                                throw new LinkGoneException(code, "click limit reached");
+                            }
+                            recordClickEvent(link.getId(), code, now, referrer, clientAddress, userAgent);
+                        } else {
+                            try {
+                                clicks.save(new ClickEvent(link, now, referrerHost(referrer),
+                                        visitorHasher.hash(clientAddress, userAgent)));
+                                links.incrementClickCount(link.getId());
+                            } catch (RuntimeException e) {
+                                log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                                meters.counter("shortener.analytics.failures").increment();
+                            }
+                        }
+            - search: "    private CreateLinkResult replay(Link existing, String targetUrl, CreateLinkCommand command) {"
+              replace: |2-
+                    private void recordClickEvent(Long linkId, String code, Instant now, String referrer, String clientAddress,
+                                                  String userAgent) {
+                        try {
+                            // The conditional UPDATE cleared the persistence context; reference the link by id.
+                            clicks.save(new ClickEvent(links.getReferenceById(linkId), now, referrerHost(referrer),
+                                    visitorHasher.hash(clientAddress, userAgent)));
+                        } catch (RuntimeException e) {
+                            log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                            meters.counter("shortener.analytics.failures").increment();
+                        }
+                    }
+
+                    private CreateLinkResult replay(Link existing, String targetUrl, CreateLinkCommand command) {
+        - path: src/test/java/io/agentic/shortener/web/MaxClicksIntegrationTest.java
+          action: create
+          task_id: T6
+          content: |
+            package io.agentic.shortener.web;
+
+            import static org.hamcrest.Matchers.nullValue;
+            import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+            import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+            import com.fasterxml.jackson.databind.ObjectMapper;
+            import org.junit.jupiter.api.Test;
+            import org.springframework.beans.factory.annotation.Autowired;
+            import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+            import org.springframework.boot.test.context.SpringBootTest;
+            import org.springframework.http.MediaType;
+            import org.springframework.test.context.ActiveProfiles;
+            import org.springframework.test.web.servlet.MockMvc;
+            import org.springframework.test.web.servlet.ResultActions;
+
+            @SpringBootTest
+            @AutoConfigureMockMvc
+            @ActiveProfiles("test")
+            class MaxClicksIntegrationTest {
+
+                @Autowired
+                MockMvc mvc;
+
+                @Autowired
+                ObjectMapper json;
+
+                @Test
+                void redirectsExactlyMaxClicksTimesThenReturnsGone() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/limited\",\"maxClicks\":2}")
+                            .andExpect(status().isCreated())
+                            .andExpect(jsonPath("$.maxClicks").value(2))
+                            .andExpect(jsonPath("$.remainingClicks").value(2)));
+
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+
+                    mvc.perform(get("/api/v1/links/" + code))
+                            .andExpect(jsonPath("$.clickCount").value(2))
+                            .andExpect(jsonPath("$.remainingClicks").value(0));
+                }
+
+                @Test
+                void singleUseLinkWorksOnce() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/once\",\"maxClicks\":1}"));
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+                }
+
+                @Test
+                void linksWithoutLimitBehaveAsBefore() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/unlimited\"}")
+                            .andExpect(jsonPath("$.maxClicks", nullValue()))
+                            .andExpect(jsonPath("$.remainingClicks", nullValue())));
+                    for (int i = 0; i < 5; i++) {
+                        mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    }
+                    mvc.perform(get("/api/v1/links/" + code)).andExpect(jsonPath("$.clickCount").value(5));
+                }
+
+                @Test
+                void rejectsOutOfRangeLimits() throws Exception {
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":0}").andExpect(status().isBadRequest());
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":-3}").andExpect(status().isBadRequest());
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":1000001}").andExpect(status().isBadRequest());
+                }
+
+                @Test
+                void idempotentReplayMustMatchLimit() throws Exception {
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
+                            .andExpect(status().isCreated());
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
+                            .andExpect(status().isOk());
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":6}"))
+                            .andExpect(status().isConflict());
+                }
+
+                private ResultActions create(String body) throws Exception {
+                    return mvc.perform(post("/api/v1/links").contentType(MediaType.APPLICATION_JSON).content(body));
+                }
+
+                private String code(ResultActions result) throws Exception {
+                    return json.readTree(result.andReturn().getResponse().getContentAsString()).get("code").asText();
+                }
+            }
+    # Round 2: produced after the orchestrator rolled back round 1 and fed back the failing test.
+    - summary: >-
+        Add maxClicks end-to-end; fix off-by-one from round 1 (conditional UPDATE must use click_count < max_clicks,
+        otherwise a link with maxClicks=N redirects N+1 times).
+      changes:
+        - path: src/main/resources/db/migration/V2__add_link_max_clicks.sql
+          action: create
+          task_id: T1
+          content: |
+            ALTER TABLE links ADD COLUMN max_clicks INTEGER;
+            ALTER TABLE links ADD CONSTRAINT ck_links_max_clicks CHECK (max_clicks IS NULL OR max_clicks > 0);
+        - path: src/main/java/io/agentic/shortener/domain/Link.java
+          action: modify
+          task_id: T2
+          edits:
+            - search: |2-
+                    @Version
+                    private long version;
+              replace: |2-
+                    @Column(name = "max_clicks")
+                    private Integer maxClicks;
+
+                    @Version
+                    private long version;
+            - search: |2-
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey) {
+                        this.code = code;
+              replace: |2-
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey) {
+                        this(code, targetUrl, createdAt, expiresAt, idempotencyKey, null);
+                    }
+
+                    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey,
+                                Integer maxClicks) {
+                        this.maxClicks = maxClicks;
+                        this.code = code;
+            - search: |2-
+                    public long getClickCount() {
+                        return clickCount;
+                    }
+              replace: |2-
+                    public long getClickCount() {
+                        return clickCount;
+                    }
+
+                    public Integer getMaxClicks() {
+                        return maxClicks;
+                    }
+
+                    /** {@code null} when the link has no click limit. */
+                    public Long getRemainingClicks() {
+                        return maxClicks == null ? null : Math.max(0L, maxClicks - clickCount);
+                    }
+        - path: src/main/java/io/agentic/shortener/repository/LinkRepository.java
+          action: modify
+          task_id: T3
+          edits:
+            - search: |2-
+                    int incrementClickCount(@Param("id") Long id);
+              replace: |2-
+                    int incrementClickCount(@Param("id") Long id);
+
+                    /** Conditional increment for limited links; returns 0 once the limit is reached (race-free). */
+                    @Modifying(clearAutomatically = true)
+                    @Query("update Link l set l.clickCount = l.clickCount + 1 where l.id = :id and l.clickCount < l.maxClicks")
+                    int incrementClickCountWithinLimit(@Param("id") Long id);
+        - path: src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "import jakarta.validation.constraints.NotBlank;"
+              replace: |2-
+                import jakarta.validation.constraints.Max;
+                import jakarta.validation.constraints.Min;
+                import jakarta.validation.constraints.NotBlank;
+            - search: "        Instant expiresAt) {"
+              replace: |2-
+                        Instant expiresAt,
+                        @Schema(description = "Optional click limit; redirects return 410 Gone once reached", example = "100")
+                        @Min(1) @Max(1_000_000) Integer maxClicks) {
+        - path: src/main/java/io/agentic/shortener/service/CreateLinkCommand.java
+          action: modify
+          task_id: T4
+          content: |
+            package io.agentic.shortener.service;
+
+            import java.time.Instant;
+
+            /** Service-layer input, decoupled from the HTTP DTO. {@code maxClicks == null} means unlimited. */
+            public record CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey,
+                                            Integer maxClicks) {
+
+                public CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey) {
+                    this(url, customAlias, expiresAt, idempotencyKey, null);
+                }
+            }
+        - path: src/main/java/io/agentic/shortener/web/dto/LinkResponse.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "        long clickCount) {"
+              replace: |2-
+                        long clickCount,
+                        Integer maxClicks,
+                        Long remainingClicks) {
+            - search: "link.isActive(), link.getClickCount());"
+              replace: |2-
+                link.isActive(), link.getClickCount(), link.getMaxClicks(),
+                                link.getRemainingClicks());
+        - path: src/main/java/io/agentic/shortener/web/LinkController.java
+          action: modify
+          task_id: T4
+          edits:
+            - search: "new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey));"
+              replace: |2-
+                new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey,
+                                        request.maxClicks()));
+        - path: src/main/java/io/agentic/shortener/service/LinkService.java
+          action: modify
+          task_id: T5
+          edits:
+            - search: "        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey());"
+              replace: |2-
+                        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey(),
+                                command.maxClicks());
+            - search: "                && Objects.equals(command.expiresAt(), existing.getExpiresAt());"
+              replace: |2-
+                                && Objects.equals(command.expiresAt(), existing.getExpiresAt())
+                                && Objects.equals(command.maxClicks(), existing.getMaxClicks());
+            - search: |2-
+                        try {
+                            clicks.save(new ClickEvent(link, now, referrerHost(referrer), visitorHasher.hash(clientAddress, userAgent)));
+                            links.incrementClickCount(link.getId());
+                        } catch (RuntimeException e) {
+                            log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                            meters.counter("shortener.analytics.failures").increment();
+                        }
+              replace: |2-
+                        if (link.getMaxClicks() != null) {
+                            // Limit check + increment in one conditional UPDATE: no overshoot under concurrent redirects.
+                            if (links.incrementClickCountWithinLimit(link.getId()) == 0) {
+                                meters.counter("shortener.redirects", "outcome", "gone").increment();
+                                throw new LinkGoneException(code, "click limit reached");
+                            }
+                            recordClickEvent(link.getId(), code, now, referrer, clientAddress, userAgent);
+                        } else {
+                            try {
+                                clicks.save(new ClickEvent(link, now, referrerHost(referrer),
+                                        visitorHasher.hash(clientAddress, userAgent)));
+                                links.incrementClickCount(link.getId());
+                            } catch (RuntimeException e) {
+                                log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                                meters.counter("shortener.analytics.failures").increment();
+                            }
+                        }
+            - search: "    private CreateLinkResult replay(Link existing, String targetUrl, CreateLinkCommand command) {"
+              replace: |2-
+                    private void recordClickEvent(Long linkId, String code, Instant now, String referrer, String clientAddress,
+                                                  String userAgent) {
+                        try {
+                            // The conditional UPDATE cleared the persistence context; reference the link by id.
+                            clicks.save(new ClickEvent(links.getReferenceById(linkId), now, referrerHost(referrer),
+                                    visitorHasher.hash(clientAddress, userAgent)));
+                        } catch (RuntimeException e) {
+                            log.warn("analytics.record_failed code={} error={}", code, e.toString());
+                            meters.counter("shortener.analytics.failures").increment();
+                        }
+                    }
+
+                    private CreateLinkResult replay(Link existing, String targetUrl, CreateLinkCommand command) {
+        - path: src/test/java/io/agentic/shortener/web/MaxClicksIntegrationTest.java
+          action: create
+          task_id: T6
+          content: |
+            package io.agentic.shortener.web;
+
+            import static org.hamcrest.Matchers.nullValue;
+            import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+            import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+            import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+            import com.fasterxml.jackson.databind.ObjectMapper;
+            import org.junit.jupiter.api.Test;
+            import org.springframework.beans.factory.annotation.Autowired;
+            import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+            import org.springframework.boot.test.context.SpringBootTest;
+            import org.springframework.http.MediaType;
+            import org.springframework.test.context.ActiveProfiles;
+            import org.springframework.test.web.servlet.MockMvc;
+            import org.springframework.test.web.servlet.ResultActions;
+
+            @SpringBootTest
+            @AutoConfigureMockMvc
+            @ActiveProfiles("test")
+            class MaxClicksIntegrationTest {
+
+                @Autowired
+                MockMvc mvc;
+
+                @Autowired
+                ObjectMapper json;
+
+                @Test
+                void redirectsExactlyMaxClicksTimesThenReturnsGone() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/limited\",\"maxClicks\":2}")
+                            .andExpect(status().isCreated())
+                            .andExpect(jsonPath("$.maxClicks").value(2))
+                            .andExpect(jsonPath("$.remainingClicks").value(2)));
+
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+
+                    mvc.perform(get("/api/v1/links/" + code))
+                            .andExpect(jsonPath("$.clickCount").value(2))
+                            .andExpect(jsonPath("$.remainingClicks").value(0));
+                }
+
+                @Test
+                void singleUseLinkWorksOnce() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/once\",\"maxClicks\":1}"));
+                    mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    mvc.perform(get("/" + code)).andExpect(status().isGone());
+                }
+
+                @Test
+                void linksWithoutLimitBehaveAsBefore() throws Exception {
+                    String code = code(create("{\"url\":\"https://example.com/unlimited\"}")
+                            .andExpect(jsonPath("$.maxClicks", nullValue()))
+                            .andExpect(jsonPath("$.remainingClicks", nullValue())));
+                    for (int i = 0; i < 5; i++) {
+                        mvc.perform(get("/" + code)).andExpect(status().isFound());
+                    }
+                    mvc.perform(get("/api/v1/links/" + code)).andExpect(jsonPath("$.clickCount").value(5));
+                }
+
+                @Test
+                void rejectsOutOfRangeLimits() throws Exception {
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":0}").andExpect(status().isBadRequest());
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":-3}").andExpect(status().isBadRequest());
+                    create("{\"url\":\"https://example.com\",\"maxClicks\":1000001}").andExpect(status().isBadRequest());
+                }
+
+                @Test
+                void idempotentReplayMustMatchLimit() throws Exception {
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
+                            .andExpect(status().isCreated());
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
+                            .andExpect(status().isOk());
+                    mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content("{\"url\":\"https://example.com/k\",\"maxClicks\":6}"))
+                            .andExpect(status().isConflict());
+                }
+
+                private ResultActions create(String body) throws Exception {
+                    return mvc.perform(post("/api/v1/links").contentType(MediaType.APPLICATION_JSON).content(body));
+                }
+
+                private String code(ResultActions result) throws Exception {
+                    return json.readTree(result.andReturn().getResponse().getContentAsString()).get("code").asText();
+                }
+            }
+
+  documentation:
+    - feature_doc_path: docs/features/click-limits.md
+      changelog_entry: >-
+        Links can now carry an optional click limit (maxClicks, 1..1,000,000). After the limit is reached redirects
+        return 410 Gone; link metadata exposes maxClicks and remainingClicks. Schema: V2 adds nullable
+        links.max_clicks. Existing links are unaffected.
+      api_examples:
+        - "curl -X POST localhost:8080/api/v1/links -H 'Content-Type: application/json' -d '{\"url\":\"https://example.com\",\"maxClicks\":1}'"
+      feature_doc: |
+        # Click limits
+
+        Short links can be limited to a number of successful redirects - useful for single-use invitations and
+        one-time downloads.
+
+        ## Creating a limited link (FR-1)
+
+        ```http
+        POST /api/v1/links
+        Content-Type: application/json
+
+        { "url": "https://example.com/invite", "maxClicks": 1 }
+        ```
+
+        `maxClicks` is optional and must be between 1 and 1,000,000; other values return `400` with a problem detail.
+
+        ## Redirect behaviour (FR-2)
+
+        A link with `maxClicks = N` redirects (`302`) exactly N times. Every later request returns `410 Gone`, the same
+        status used for expired and deactivated links. Refused redirects are not counted.
+
+        The limit is enforced by a single conditional `UPDATE ... WHERE click_count < max_clicks`, so concurrent
+        redirects can never exceed it.
+
+        ## Metadata (FR-3)
+
+        `GET /api/v1/links/{code}` returns `maxClicks` and `remainingClicks` (both `null` for unlimited links).
+
+        ## Compatibility (FR-4)
+
+        - Migration `V2__add_link_max_clicks.sql` adds a nullable column; existing rows mean "unlimited".
+        - Links without `maxClicks` follow the exact previous code path.
+        - An `Idempotency-Key` replay must repeat the same `maxClicks`; a different value returns `409`.
+
+        ## Limitations
+
+        - The limit cannot be changed after creation.
+        - Response objects gained two fields; clients with strict deserialisation must accept unknown properties.

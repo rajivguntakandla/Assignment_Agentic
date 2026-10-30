@@ -1,0 +1,19 @@
+# Java
+url-shortener/target/
+url-shortener/data/
+# Python
+orchestrator/.venv/
+orchestrator/runs/
+orchestrator/*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+# OS / IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/
+# Not for publication: confidential assignment brief and personal screenshots
+*.pdf
+testcases/

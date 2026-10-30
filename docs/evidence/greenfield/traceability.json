@@ -1,0 +1,58 @@
+[
+  {
+    "requirement": "FR-1",
+    "text": "POST /api/v1/links/bulk accepts between 1 and 100 link requests (url, optional customAlias, optional expiresAt).",
+    "tasks": [
+      "T1",
+      "T2",
+      "T3",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/web/BulkLinkController.java",
+      "src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksRequest.java",
+      "src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksResponse.java",
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-2",
+    "text": "Items are processed independently; an invalid or conflicting item does not prevent other items from being created.",
+    "tasks": [
+      "T2",
+      "T3",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/web/BulkLinkController.java",
+      "src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksResponse.java",
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-3",
+    "text": "Batches with zero items, more than 100 items, or no items field are rejected as a whole with HTTP 400.",
+    "tasks": [
+      "T1",
+      "T3",
+      "T4"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/web/BulkLinkController.java",
+      "src/main/java/io/agentic/shortener/web/dto/BulkCreateLinksRequest.java",
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/web/BulkLinkApiIntegrationTest.java"
+    ],
+    "verified": true
+  }
+]

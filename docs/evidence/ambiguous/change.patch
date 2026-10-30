@@ -1,0 +1,198 @@
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,5 @@
++# Changelog
++
++## 2026-10-30 - Safer short links
++
++Link creation now rejects destinations on the operator-maintained denylist shortener.blocked-domains (including subdomains, matched on DNS label boundaries). Empty by default; existing links are unchanged.
+--- /dev/null
++++ b/docs/features/domain-denylist.md
+@@ -0,0 +1,30 @@
++# Domain denylist
++
++Origin: the request "make our short links safer" was clarified with the product owner into a concrete,
++testable rule: refuse to shorten URLs that point at operator-listed domains.
++
++## Configuration (FR-1)
++
++```yaml
++shortener:
++  blocked-domains: [evil.example, phish.test]
++```
++
++Or via environment: `SHORTENER_BLOCKED_DOMAINS=evil.example,phish.test`. Entries are trimmed, lower-cased and
++stripped of a trailing dot at startup. The default list is empty, which preserves previous behaviour.
++
++## Behaviour (FR-2)
++
++`POST /api/v1/links` (and every other creation path, because the check lives in `UrlValidator`) returns `400`
++with the problem detail `Links to this domain are blocked by policy` when the host equals a listed domain or
++is any subdomain of it (`login.evil.example`). Matching is case-insensitive.
++
++## What is not blocked (FR-3)
++
++Matching respects DNS label boundaries: with `evil.example` listed, `notevil.example` and `evil.example.com`
++are allowed. Links created before a domain was listed keep working (no retroactive changes).
++
++## Limitations
++
++- The list is static configuration; changes need a restart.
++- No reputation feeds or DNS-based checks; a denylist only stops domains someone has already reported.
+--- a/src/main/java/io/agentic/shortener/config/ShortenerProperties.java
++++ b/src/main/java/io/agentic/shortener/config/ShortenerProperties.java
+@@ -4,6 +4,7 @@
+ import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
+ import java.util.List;
++import java.util.Locale;
+ import org.springframework.boot.context.properties.ConfigurationProperties;
+ import org.springframework.validation.annotation.Validated;
+ 
+@@ -19,11 +20,18 @@
+         @Min(1) @Max(10) int maxCodeGenerationAttempts,
+         @NotBlank String visitorHashSalt,
+         List<String> reservedCodes,
+-        RateLimit rateLimit) {
++        RateLimit rateLimit,
++        List<String> blockedDomains) {
+ 
+     public ShortenerProperties {
+         reservedCodes = reservedCodes == null ? List.of() : List.copyOf(reservedCodes);
+         rateLimit = rateLimit == null ? new RateLimit(true, 20, 20) : rateLimit;
++        blockedDomains = blockedDomains == null ? List.of() : blockedDomains.stream()
++                .map(d -> d.trim().toLowerCase(Locale.ROOT))
++                .map(d -> d.endsWith(".") ? d.substring(0, d.length() - 1) : d)
++                .filter(d -> !d.isEmpty())
++                .distinct()
++                .toList();
+     }
+ 
+     /** Token-bucket settings applied to link creation, per client address. */
+--- a/src/main/java/io/agentic/shortener/service/UrlValidator.java
++++ b/src/main/java/io/agentic/shortener/service/UrlValidator.java
+@@ -62,7 +62,21 @@
+         if (host.equals(ownHost)) {
+             throw new InvalidUrlException("URLs pointing back to this shortener are not allowed");
+         }
++        if (isBlockedDomain(host)) {
++            throw new InvalidUrlException("Links to this domain are blocked by policy");
++        }
+         return uri;
++    }
++
++    /** Exact domain or any subdomain, on DNS label boundaries: "notevil.example" does not match "evil.example". */
++    boolean isBlockedDomain(String host) {
++        String normalized = host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
++        for (String blocked : properties.blockedDomains()) {
++            if (normalized.equals(blocked) || normalized.endsWith("." + blocked)) {
++                return true;
++            }
++        }
++        return false;
+     }
+ 
+     static boolean isInternalHost(String host) {
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -24,6 +24,8 @@
+   max-code-generation-attempts: 5
+   visitor-hash-salt: ${SHORTENER_VISITOR_SALT:change-me-in-production}
+   reserved-codes: [api, actuator, swagger-ui, v3, health, admin, static]
++  # Operator-maintained denylist; subdomains of listed domains are blocked as well.
++  blocked-domains: []
+   rate-limit:
+     enabled: true
+     capacity: 20
+--- a/src/test/java/io/agentic/shortener/service/UrlValidatorTest.java
++++ b/src/test/java/io/agentic/shortener/service/UrlValidatorTest.java
+@@ -12,7 +12,7 @@
+ class UrlValidatorTest {
+ 
+     private final UrlValidator validator = new UrlValidator(new ShortenerProperties(
+-            "https://sho.rt", 7, 100, 5, "salt", List.of(), null));
++            "https://sho.rt", 7, 100, 5, "salt", List.of(), null, List.of("evil.example", " Phish.TEST. ")));
+ 
+     @ParameterizedTest
+     @ValueSource(strings = {
+@@ -48,6 +48,31 @@
+         assertThatThrownBy(() -> validator.validate(url)).isInstanceOf(InvalidUrlException.class);
+     }
+ 
++    @ParameterizedTest
++    @ValueSource(strings = {
++            "https://evil.example/login",
++            "https://EVIL.example",
++            "https://login.evil.example/path",
++            "http://a.b.phish.test/"})
++    void rejectsBlockedDomainsAndTheirSubdomains(String url) {
++        assertThatThrownBy(() -> validator.validate(url))
++                .isInstanceOf(InvalidUrlException.class)
++                .hasMessageContaining("blocked");
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {"https://notevil.example", "https://evil.example.com", "https://phish.testing.org"})
++    void allowsLookalikeButDistinctDomains(String url) {
++        assertThat(validator.validate(url).getHost()).isNotBlank();
++    }
++
++    @Test
++    void normalisesConfiguredDomains() {
++        assertThat(new ShortenerProperties("https://sho.rt", 7, 100, 5, "salt", null, null,
++                List.of(" Evil.Example. ", "", "evil.example")).blockedDomains())
++                .containsExactly("evil.example");
++    }
++
+     @Test
+     void rejectsBlankAndOverlongUrls() {
+         assertThatThrownBy(() -> validator.validate(" ")).isInstanceOf(InvalidUrlException.class);
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/web/BlockedDomainIntegrationTest.java
+@@ -0,0 +1,46 @@
++package io.agentic.shortener.web;
++
++import static org.hamcrest.Matchers.containsString;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.ResultActions;
++
++@SpringBootTest(properties = "shortener.blocked-domains=evil.example,Phish.Test")
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++class BlockedDomainIntegrationTest {
++
++    @Autowired
++    MockMvc mvc;
++
++    @Test
++    void rejectsBlockedDomainAndSubdomainsWithProblemDetail() throws Exception {
++        create("https://login.evil.example/reset")
++                .andExpect(status().isBadRequest())
++                .andExpect(header().string("Content-Type", containsString("application/problem+json")))
++                .andExpect(jsonPath("$.detail").value("Links to this domain are blocked by policy"));
++        create("https://PHISH.test/x").andExpect(status().isBadRequest());
++    }
++
++    @Test
++    void lookalikeAndOtherDomainsAreUnaffected() throws Exception {
++        create("https://notevil.example/").andExpect(status().isCreated());
++        create("https://evil.example.com/").andExpect(status().isCreated());
++        create("https://example.org/").andExpect(status().isCreated());
++    }
++
++    private ResultActions create(String url) throws Exception {
++        return mvc.perform(post("/api/v1/links").contentType(MediaType.APPLICATION_JSON)
++                .content("{\"url\":\"" + url + "\"}"));
++    }
++}

@@ -1,0 +1,105 @@
+[
+  {
+    "requirement": "FR-1",
+    "text": "Expose GET /api/v1/links. It returns HTTP 200 with a bare JSON array (no envelope) of link items, ordered newest first by creation time.",
+    "tasks": [
+      "T1",
+      "T2",
+      "T4",
+      "T5"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-2",
+    "text": "Accept an optional query parameter limit. It defaults to 20 and must be an integer from 1 to 100 inclusive. The response contains at most limit items: the limit newest visible links.",
+    "tasks": [
+      "T1",
+      "T2",
+      "T4",
+      "T5"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-3",
+    "text": "Reject a limit outside 1..100 with HTTP 400 and an RFC 9457 problem detail body, consistent with the service's existing error responses.",
+    "tasks": [
+      "T2",
+      "T5"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-4",
+    "text": "Each item in the array has exactly the same JSON shape (field names, types and formatting) as the response body of GET /api/v1/links/{code} for that link.",
+    "tasks": [
+      "T2",
+      "T5"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "verified": true
+  },
+  {
+    "requirement": "FR-5",
+    "text": "The list includes exactly the links for which GET /api/v1/links/{code} would succeed, under the same access control that already protects GET /api/v1/links/{code}. No additional per-caller ownership filtering is applied.",
+    "tasks": [
+      "T1",
+      "T2",
+      "T3",
+      "T4",
+      "T5"
+    ],
+    "files": [
+      "src/main/java/io/agentic/shortener/repository/LinkRepository.java",
+      "src/main/java/io/agentic/shortener/service/LinkService.java",
+      "src/main/java/io/agentic/shortener/web/LinkController.java",
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListAccessParityTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "tests": [
+      "src/test/java/io/agentic/shortener/repository/LinkRepositoryRecentLinksTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListAccessParityTest.java",
+      "src/test/java/io/agentic/shortener/web/LinkListApiIntegrationTest.java"
+    ],
+    "verified": true
+  }
+]

@@ -1,0 +1,336 @@
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,5 @@
++# Changelog
++
++## 2026-10-30 - Click limits for short links
++
++Links can now carry an optional click limit (maxClicks, 1..1,000,000). After the limit is reached redirects return 410 Gone; link metadata exposes maxClicks and remainingClicks. Schema: V2 adds nullable links.max_clicks. Existing links are unaffected.
+--- /dev/null
++++ b/docs/features/click-limits.md
+@@ -0,0 +1,38 @@
++# Click limits
++
++Short links can be limited to a number of successful redirects - useful for single-use invitations and
++one-time downloads.
++
++## Creating a limited link (FR-1)
++
++```http
++POST /api/v1/links
++Content-Type: application/json
++
++{ "url": "https://example.com/invite", "maxClicks": 1 }
++```
++
++`maxClicks` is optional and must be between 1 and 1,000,000; other values return `400` with a problem detail.
++
++## Redirect behaviour (FR-2)
++
++A link with `maxClicks = N` redirects (`302`) exactly N times. Every later request returns `410 Gone`, the same
++status used for expired and deactivated links. Refused redirects are not counted.
++
++The limit is enforced by a single conditional `UPDATE ... WHERE click_count < max_clicks`, so concurrent
++redirects can never exceed it.
++
++## Metadata (FR-3)
++
++`GET /api/v1/links/{code}` returns `maxClicks` and `remainingClicks` (both `null` for unlimited links).
++
++## Compatibility (FR-4)
++
++- Migration `V2__add_link_max_clicks.sql` adds a nullable column; existing rows mean "unlimited".
++- Links without `maxClicks` follow the exact previous code path.
++- An `Idempotency-Key` replay must repeat the same `maxClicks`; a different value returns `409`.
++
++## Limitations
++
++- The limit cannot be changed after creation.
++- Response objects gained two fields; clients with strict deserialisation must accept unknown properties.
+--- a/src/main/java/io/agentic/shortener/domain/Link.java
++++ b/src/main/java/io/agentic/shortener/domain/Link.java
+@@ -38,6 +38,9 @@
+     @Column(name = "click_count", nullable = false)
+     private long clickCount;
+ 
++    @Column(name = "max_clicks")
++    private Integer maxClicks;
++
+     @Version
+     private long version;
+ 
+@@ -46,6 +49,12 @@
+     }
+ 
+     public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey) {
++        this(code, targetUrl, createdAt, expiresAt, idempotencyKey, null);
++    }
++
++    public Link(String code, String targetUrl, Instant createdAt, Instant expiresAt, String idempotencyKey,
++                Integer maxClicks) {
++        this.maxClicks = maxClicks;
+         this.code = code;
+         this.targetUrl = targetUrl;
+         this.createdAt = createdAt;
+@@ -92,4 +101,13 @@
+     public long getClickCount() {
+         return clickCount;
+     }
++
++    public Integer getMaxClicks() {
++        return maxClicks;
++    }
++
++    /** {@code null} when the link has no click limit. */
++    public Long getRemainingClicks() {
++        return maxClicks == null ? null : Math.max(0L, maxClicks - clickCount);
++    }
+ }
+--- a/src/main/java/io/agentic/shortener/repository/LinkRepository.java
++++ b/src/main/java/io/agentic/shortener/repository/LinkRepository.java
+@@ -19,4 +19,9 @@
+     @Modifying(clearAutomatically = true)
+     @Query("update Link l set l.clickCount = l.clickCount + 1 where l.id = :id")
+     int incrementClickCount(@Param("id") Long id);
++
++    /** Conditional increment for limited links; returns 0 once the limit is reached (race-free). */
++    @Modifying(clearAutomatically = true)
++    @Query("update Link l set l.clickCount = l.clickCount + 1 where l.id = :id and l.clickCount < l.maxClicks")
++    int incrementClickCountWithinLimit(@Param("id") Long id);
+ }
+--- a/src/main/java/io/agentic/shortener/service/CreateLinkCommand.java
++++ b/src/main/java/io/agentic/shortener/service/CreateLinkCommand.java
+@@ -2,6 +2,11 @@
+ 
+ import java.time.Instant;
+ 
+-/** Service-layer input, decoupled from the HTTP DTO. */
+-public record CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey) {
++/** Service-layer input, decoupled from the HTTP DTO. {@code maxClicks == null} means unlimited. */
++public record CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey,
++                                Integer maxClicks) {
++
++    public CreateLinkCommand(String url, String customAlias, Instant expiresAt, String idempotencyKey) {
++        this(url, customAlias, expiresAt, idempotencyKey, null);
++    }
+ }
+--- a/src/main/java/io/agentic/shortener/service/LinkService.java
++++ b/src/main/java/io/agentic/shortener/service/LinkService.java
+@@ -61,7 +61,8 @@
+         }
+ 
+         String code = command.customAlias() != null ? reserveAlias(command.customAlias()) : generateUniqueCode();
+-        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey());
++        Link link = new Link(code, targetUrl, now, command.expiresAt(), command.idempotencyKey(),
++                command.maxClicks());
+         try {
+             link = links.saveAndFlush(link);
+         } catch (DataIntegrityViolationException e) {
+@@ -97,12 +98,22 @@
+             meters.counter("shortener.redirects", "outcome", "gone").increment();
+             throw new LinkGoneException(code, "expired");
+         }
+-        try {
+-            clicks.save(new ClickEvent(link, now, referrerHost(referrer), visitorHasher.hash(clientAddress, userAgent)));
+-            links.incrementClickCount(link.getId());
+-        } catch (RuntimeException e) {
+-            log.warn("analytics.record_failed code={} error={}", code, e.toString());
+-            meters.counter("shortener.analytics.failures").increment();
++        if (link.getMaxClicks() != null) {
++            // Limit check + increment in one conditional UPDATE: no overshoot under concurrent redirects.
++            if (links.incrementClickCountWithinLimit(link.getId()) == 0) {
++                meters.counter("shortener.redirects", "outcome", "gone").increment();
++                throw new LinkGoneException(code, "click limit reached");
++            }
++            recordClickEvent(link.getId(), code, now, referrer, clientAddress, userAgent);
++        } else {
++            try {
++                clicks.save(new ClickEvent(link, now, referrerHost(referrer),
++                        visitorHasher.hash(clientAddress, userAgent)));
++                links.incrementClickCount(link.getId());
++            } catch (RuntimeException e) {
++                log.warn("analytics.record_failed code={} error={}", code, e.toString());
++                meters.counter("shortener.analytics.failures").increment();
++            }
+         }
+         meters.counter("shortener.redirects", "outcome", "redirected").increment();
+         return link.getTargetUrl();
+@@ -115,10 +126,23 @@
+         log.info("link.deactivated code={}", code);
+     }
+ 
++    private void recordClickEvent(Long linkId, String code, Instant now, String referrer, String clientAddress,
++                                  String userAgent) {
++        try {
++            // The conditional UPDATE cleared the persistence context; reference the link by id.
++            clicks.save(new ClickEvent(links.getReferenceById(linkId), now, referrerHost(referrer),
++                    visitorHasher.hash(clientAddress, userAgent)));
++        } catch (RuntimeException e) {
++            log.warn("analytics.record_failed code={} error={}", code, e.toString());
++            meters.counter("shortener.analytics.failures").increment();
++        }
++    }
++
+     private CreateLinkResult replay(Link existing, String targetUrl, CreateLinkCommand command) {
+         boolean sameRequest = existing.getTargetUrl().equals(targetUrl)
+                 && (command.customAlias() == null || command.customAlias().equals(existing.getCode()))
+-                && Objects.equals(command.expiresAt(), existing.getExpiresAt());
++                && Objects.equals(command.expiresAt(), existing.getExpiresAt())
++                && Objects.equals(command.maxClicks(), existing.getMaxClicks());
+         if (!sameRequest) {
+             throw new ConflictException("Idempotency-Key was already used with a different request");
+         }
+--- a/src/main/java/io/agentic/shortener/web/LinkController.java
++++ b/src/main/java/io/agentic/shortener/web/LinkController.java
+@@ -50,7 +50,8 @@
+             @Valid @RequestBody CreateLinkRequest request,
+             @RequestHeader(name = "Idempotency-Key", required = false) @Size(min = 1, max = 128) String idempotencyKey) {
+         CreateLinkResult result = linkService.create(
+-                new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey));
++                new CreateLinkCommand(request.url(), request.customAlias(), request.expiresAt(), idempotencyKey,
++                        request.maxClicks()));
+         LinkResponse body = LinkResponse.from(result.link(), properties.baseUrl());
+         if (!result.created()) {
+             return ResponseEntity.ok(body);
+--- a/src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java
++++ b/src/main/java/io/agentic/shortener/web/dto/CreateLinkRequest.java
+@@ -1,6 +1,8 @@
+ package io.agentic.shortener.web.dto;
+ 
+ import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
+ import jakarta.validation.constraints.NotBlank;
+ import jakarta.validation.constraints.Pattern;
+ import jakarta.validation.constraints.Size;
+@@ -14,5 +16,7 @@
+         @Pattern(regexp = "^[A-Za-z0-9_-]{3,32}$", message = "must be 3-32 characters of [A-Za-z0-9_-]")
+         String customAlias,
+         @Schema(description = "Optional absolute expiry (ISO-8601, must be in the future)")
+-        Instant expiresAt) {
++        Instant expiresAt,
++        @Schema(description = "Optional click limit; redirects return 410 Gone once reached", example = "100")
++        @Min(1) @Max(1_000_000) Integer maxClicks) {
+ }
+--- a/src/main/java/io/agentic/shortener/web/dto/LinkResponse.java
++++ b/src/main/java/io/agentic/shortener/web/dto/LinkResponse.java
+@@ -10,11 +10,14 @@
+         Instant createdAt,
+         Instant expiresAt,
+         boolean active,
+-        long clickCount) {
++        long clickCount,
++        Integer maxClicks,
++        Long remainingClicks) {
+ 
+     public static LinkResponse from(Link link, String baseUrl) {
+         String base = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+         return new LinkResponse(link.getCode(), base + "/" + link.getCode(), link.getTargetUrl(),
+-                link.getCreatedAt(), link.getExpiresAt(), link.isActive(), link.getClickCount());
++                link.getCreatedAt(), link.getExpiresAt(), link.isActive(), link.getClickCount(), link.getMaxClicks(),
++                link.getRemainingClicks());
+     }
+ }
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__add_link_max_clicks.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE links ADD COLUMN max_clicks INTEGER;
++ALTER TABLE links ADD CONSTRAINT ck_links_max_clicks CHECK (max_clicks IS NULL OR max_clicks > 0);
+--- /dev/null
++++ b/src/test/java/io/agentic/shortener/web/MaxClicksIntegrationTest.java
+@@ -0,0 +1,95 @@
++package io.agentic.shortener.web;
++
++import static org.hamcrest.Matchers.nullValue;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.ActiveProfiles;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.ResultActions;
++
++@SpringBootTest
++@AutoConfigureMockMvc
++@ActiveProfiles("test")
++class MaxClicksIntegrationTest {
++
++    @Autowired
++    MockMvc mvc;
++
++    @Autowired
++    ObjectMapper json;
++
++    @Test
++    void redirectsExactlyMaxClicksTimesThenReturnsGone() throws Exception {
++        String code = code(create("{\"url\":\"https://example.com/limited\",\"maxClicks\":2}")
++                .andExpect(status().isCreated())
++                .andExpect(jsonPath("$.maxClicks").value(2))
++                .andExpect(jsonPath("$.remainingClicks").value(2)));
++
++        mvc.perform(get("/" + code)).andExpect(status().isFound());
++        mvc.perform(get("/" + code)).andExpect(status().isFound());
++        mvc.perform(get("/" + code)).andExpect(status().isGone());
++        mvc.perform(get("/" + code)).andExpect(status().isGone());
++
++        mvc.perform(get("/api/v1/links/" + code))
++                .andExpect(jsonPath("$.clickCount").value(2))
++                .andExpect(jsonPath("$.remainingClicks").value(0));
++    }
++
++    @Test
++    void singleUseLinkWorksOnce() throws Exception {
++        String code = code(create("{\"url\":\"https://example.com/once\",\"maxClicks\":1}"));
++        mvc.perform(get("/" + code)).andExpect(status().isFound());
++        mvc.perform(get("/" + code)).andExpect(status().isGone());
++    }
++
++    @Test
++    void linksWithoutLimitBehaveAsBefore() throws Exception {
++        String code = code(create("{\"url\":\"https://example.com/unlimited\"}")
++                .andExpect(jsonPath("$.maxClicks", nullValue()))
++                .andExpect(jsonPath("$.remainingClicks", nullValue())));
++        for (int i = 0; i < 5; i++) {
++            mvc.perform(get("/" + code)).andExpect(status().isFound());
++        }
++        mvc.perform(get("/api/v1/links/" + code)).andExpect(jsonPath("$.clickCount").value(5));
++    }
++
++    @Test
++    void rejectsOutOfRangeLimits() throws Exception {
++        create("{\"url\":\"https://example.com\",\"maxClicks\":0}").andExpect(status().isBadRequest());
++        create("{\"url\":\"https://example.com\",\"maxClicks\":-3}").andExpect(status().isBadRequest());
++        create("{\"url\":\"https://example.com\",\"maxClicks\":1000001}").andExpect(status().isBadRequest());
++    }
++
++    @Test
++    void idempotentReplayMustMatchLimit() throws Exception {
++        mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
++                .andExpect(status().isCreated());
++        mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"url\":\"https://example.com/k\",\"maxClicks\":5}"))
++                .andExpect(status().isOk());
++        mvc.perform(post("/api/v1/links").header("Idempotency-Key", "limit-key")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"url\":\"https://example.com/k\",\"maxClicks\":6}"))
++                .andExpect(status().isConflict());
++    }
++
++    private ResultActions create(String body) throws Exception {
++        return mvc.perform(post("/api/v1/links").contentType(MediaType.APPLICATION_JSON).content(body));
++    }
++
++    private String code(ResultActions result) throws Exception {
++        return json.readTree(result.andReturn().getResponse().getContentAsString()).get("code").asText();
++    }
++}
